@@ -32,6 +32,27 @@ export function plain(s) {
   return t;
 }
 
+/** "**Exam steer:** text" → a small caption ("Exam steer") on its own line, then the text. Labels up to 40 characters,
+ *  with the colon inside or after the bold; "Check yourself" is captioned in the accent. Returns the HTML, or null. */
+export function leadIn(text) {
+  const m = String(text ?? "").match(/^\s*\*\*([^*\n]{1,40}?):\*\*:?\s*|^\s*\*\*([^*\n]{1,40}?)\*\*:\s*/);
+  if (!m) return null;
+  const label = (m[1] ?? m[2]).trim(), rest = text.slice(m[0].length);
+  const body = rest.trim().replace(/^\p{Ll}/u, (c) => c.toUpperCase());
+  return `<p class="lead-cap${/^check yourself/i.test(label) ? " accent" : ""}">${inline(label)}</p>${body ? `<p>${inline(body)}</p>` : ""}`;
+}
+const para = (text) => leadIn(text) ?? `<p>${inline(text)}</p>`;
+
+/** An answers callout: "**Answers.** 1 Because… 2 Hidden…" → the label goes and numbered answers become a list. */
+export function answers(text) {
+  const body = String(text ?? "").replace(/^\s*(?:\*\*|_)?(?:check[- ]yourself answers|answers)[.:]?(?:\*\*|_)?[.:]?\s*/i, "").replace(/\s*\n\s*/g, " ").trim();
+  const parts = body.split(/(?:^|(?<=[.?!)])\s+)(\d{1,2})[.)]?\s+(?=\S)/);
+  const items = [];
+  for (let i = 1; i < parts.length; i += 2) items.push([Number(parts[i]), parts[i + 1].trim()]);
+  const listed = parts[0].trim() === "" && items.length >= 2 && items.every(([n], k) => n === k + 1);
+  return listed ? `<ol>${items.map(([, t]) => `<li>${inline(t)}</li>`).join("")}</ol>` : `<p>${inline(body)}</p>`;
+}
+
 /** A table: a grid up to two columns; wider ones stack one row per card line, each cell after the first labelled with
  *  its column (DocTable / MarkdownView's stacked rows, which is how they read at phone width). */
 export function table(header, rows) {
@@ -81,7 +102,7 @@ export function markdown(src, sections = null) {
       start("blockquote");
       out.push(`<p>${inline(line.replace(/^(>\s?)+/, ""))}</p>`);
     } else {
-      close(); out.push(`<p>${inline(line)}</p>`);
+      close(); out.push(para(line));
     }
   }
   close();
@@ -121,21 +142,21 @@ function block(b, i, state, sections) {
       sections.push({ id: `sec-${i}`, title: plain(text) });
       return `<h3 class="doc-h2" id="sec-${i}">${inline(text)}</h3>`;
     case "h3": return `<h4>${inline(text)}</h4>`;
-    case "p": return `<p>${inline(text)}</p>`;
-    case "meta": return `<p class="caption">${inline(text)}</p>`;
-    case "quote": return `<blockquote class="doc-quote"><p>${inline(text)}</p></blockquote>`;
+    case "p": return para(text);
+    case "meta": return i <= 1 ? "" : `<p class="caption">${inline(text)}</p>`; // the header line repeats the screen's own header
+    case "quote": return `<figure class="doc-quote"><blockquote><p>${inline(text)}</p></blockquote>${str(b.by) ? `<figcaption>${inline(b.by)}</figcaption>` : ""}</figure>`;
     case "inshort": return `<div class="card inshort"><p class="strong">In short</p>${list("ul")}</div>`;
     case "bullets": return list("ul");
     case "numbers": return list("ol");
     case "sources": return `<ol class="sources">${items.map((x) => `<li>${inline(x)}</li>`).join("")}</ol>`;
     case "callout": {
       const tone = ["key", "warn", "note"].includes(b.tone) ? b.tone : "note";
+      if (isAnswers(text)) return `<details class="reveal" data-fold="${i}"${state.open?.has(String(i)) ? " open" : ""}><summary>
+        <span>Answers</span><span class="act"><span class="when-closed">Show</span><span class="when-open">Hide</span></span>
+      </summary><div class="callout c-${tone}">${answers(text)}</div></details>`;
       const html = `<div class="callout c-${tone}">${text.split("\n").filter(Boolean)
-        .map((l) => (l.startsWith("• ") ? `<p class="bullet">${inline(l.slice(2))}</p>` : `<p>${inline(l)}</p>`)).join("")}</div>`;
-      if (!isAnswers(text)) return html;
-      return `<details class="reveal" data-fold="${i}"${state.open?.has(String(i)) ? " open" : ""}><summary>
-        <span class="caption when-closed">Answers hidden until you've tried</span><span class="act"><span class="when-closed">Reveal</span><span class="when-open">Hide answers</span></span>
-      </summary>${html}</details>`;
+        .map((l) => (l.startsWith("• ") ? `<p class="bullet">${inline(l.slice(2))}</p>` : para(l))).join("")}</div>`;
+      return html;
     }
     case "table": return table(arr(b.header).map((x) => String(x ?? "")), arr(b.rows).filter(Array.isArray).map((r) => r.map((x) => String(x ?? ""))));
     case "diagram": return diagram(b.diagram, str(b.caption), i, state);
@@ -173,18 +194,22 @@ function diagram(d, caption, i, state) {
     body = `<ol class="dg-time">${events.map((e) => `<li class="tone-${tone(e.tone)}"><b>${esc(e.label)}</b><i aria-hidden="true"></i><span>${esc(e.text)}</span></li>`).join("")}</ol>`;
   } else {
     const rows = [...new Set(nodes.map((n) => n.row))].map((r) => nodes.filter((n) => n.row === r));
+    // An argument map (any key, con or verdict box) reads by its captions: Claim, For, Against, Verdict. A plain flow keeps its arrows.
+    const argument = nodes.some((n) => n.tone !== "plain");
+    const role = (n) => (n.tone === "key" ? "For" : n.tone === "con" ? "Against" : n.tone === "verdict" ? "Verdict" : n.row === nodes[0].row ? "Claim" : "");
     const inner = (n) => `<b>${esc(n.title)}</b>${n.sub ? `<small>${esc(n.sub)}</small>` : ""}`;
     const box = (n) => !blankable(n) ? `<div class="dg-node tone-${n.tone}">${inner(n)}</div>`
       : `<button type="button" class="dg-node tone-${hidden(n) ? "blank" : n.tone}" data-dg="${i}" data-node="${esc(n.id)}" aria-pressed="${!hidden(n)}"${hidden(n) ? ` aria-label="Blank box"` : ""}>${hidden(n) ? "" : inner(n)}</button>`;
     const name = (n) => (hidden(n) ? `<span class="blank-name" aria-label="blank">?</span>` : esc(n.title));
-    body = `<div class="dg-rows">${rows.map((row) => `<div class="dg-row">${row.map(box).join("")}</div>`).join("")}</div>
-      ${edges.length ? `<ul class="dg-edges">${edges.map((e) => `<li${e.style === "dashed" ? ` class="against"` : ""}>${name(byId.get(e.from))} <i>${esc(e.verb)}</i> ${e.style === "dashed" ? "⇢" : "→"} ${name(byId.get(e.to))}</li>`).join("")}</ul>` : ""}`;
+    const groups = argument ? rows.flatMap((row) => [...new Set(row.map(role))].map((r) => [r, row.filter((n) => role(n) === r)])) : rows.map((row) => ["", row]);
+    body = `<div class="dg-rows">${groups.map(([r, row]) => `<div class="dg-group">${r ? `<p class="dg-cap">${r}</p>` : ""}<div class="dg-row">${row.map(box).join("")}</div></div>`).join("")}</div>
+      ${edges.length && !argument ? `<ul class="dg-edges">${edges.map((e) => `<li${e.style === "dashed" ? ` class="against"` : ""}>${name(byId.get(e.from))} <i>${esc(e.verb)}</i> ${e.style === "dashed" ? "⇢" : "→"} ${name(byId.get(e.to))}</li>`).join("")}</ul>` : ""}`;
   }
   const blanks = nodes.filter(blankable), all = blanks.every((n) => !hidden(n));
   return `<figure class="card diagram">
-    ${str(d.title) ? `<p class="strong">${esc(d.title)}</p>` : ""}${str(d.note) ? `<p class="caption">${inline(d.note)}</p>` : ""}
-    ${body}${caption ? `<figcaption>${inline(caption)}</figcaption>` : ""}
-    ${blanks.length ? `<div class="dg-foot"><span class="caption">Tap a box to check it</span><button type="button" class="link" data-dg-all="${i}">${all ? "Hide all" : "Reveal all"}</button></div>` : ""}
+    ${str(d.title) ? `<p class="strong">${esc(d.title)}</p>` : ""}${str(d.note) && d.type !== "graph" ? `<p class="caption">${inline(d.note)}</p>` : ""}
+    ${blank && caption ? `<figcaption class="above">${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}${body}${caption && !blank ? `<figcaption>${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}
+    ${blanks.length ? `<div class="dg-foot"><button type="button" class="link" data-dg-all="${i}">${all ? "Hide all" : "Show all"}</button></div>` : ""}
   </figure>`;
 }
 
