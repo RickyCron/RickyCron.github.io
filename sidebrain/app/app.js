@@ -5,7 +5,7 @@
 // Writes go through a small outbox in localStorage, so a review on a train with no signal is never lost.
 import { schedule, intervalLabel, due, nextDue, examDays, todayString, daysBetween, addDays } from "./sm2.js";
 import { withoutGreeting, dueSoon, dueLabel, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS } from "./today.js";
-import { esc, markdown, lectureDoc, lectureNotes, ordered } from "./notes.js";
+import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay } from "./notes.js";
 
 // ---- Settings to fill in before publishing (web/(C) README.md) ----
 const SUPABASE_URL = "https://rdwavprncthvujmckige.supabase.co";
@@ -551,7 +551,8 @@ async function signOut() {
   outbox = []; captures = [];
   $("sheet").close();
   navigator.clearAppBadge?.().catch(() => {});
-  await sb?.auth.signOut();
+  // Local scope: supabase-js defaults to "global", which revoked the Macs' sessions too (7 Oct, sync stopped on both).
+  await sb?.auth.signOut({ scope: "local" });
   signedOut();
 }
 
@@ -979,7 +980,7 @@ function homeScreen(today) {
   let html = head("Study", !n && cards.length ? caughtUp(nextDue(cards, today)) : "") + notices();
   if (n) html += `<button class="btn primary mt-20" type="button" data-act="review">Review ${plural(n, "card")}</button>`;
   if (practice.length) {
-    html += `<ul class="group mt-20">${row({ tag: "button", attrs: `data-practice=""`, lead: ICON.practice, title: "Practice", trail: open ? `${open} to try` : "All tried", chev: true })}</ul>`;
+    html += `<ul class="group mt-20">${row({ tag: "button", attrs: `data-practice=""`, lead: ICON.practice, title: open ? plural(open, "practice question") : "All practice attempted", chev: true })}</ul>`;
   }
   if (!modules.length) return html + empty(ICON.books, "No modules yet", "Modules, lecture notes and flashcards arrive after the next lecture sync on the Mac.");
   return html + `<h2 class="section">Modules</h2><ul class="group flat">${modules.map((m) => {
@@ -996,7 +997,7 @@ function moduleScreen(name, today) {
   const linked = new Set(lectures.flatMap((l) => [l.data?.pre, l.data?.post, l.user_data?.builtPost]));
   const covered = new Set(lecs.map((l) => String(l.data?.n ?? "").toUpperCase()));
   const more = [...noteById.values()].filter((x) => x.module === name && x.data?.kind !== "readings" && !linked.has(x.id) && !covered.has(String(x.data?.lecture ?? "").toUpperCase()));
-  const coming = lecs.filter((l) => l.date && l.date.slice(0, 10) >= today).sort((a, b) => (a.date < b.date ? -1 : 1))[0];
+  const coming = lecs.filter((l) => (lectureDay(l) ?? "").slice(0, 10) >= today).sort((a, b) => (a.date < b.date ? -1 : 1))[0];
   const by = [d.convenor, d.code].filter(Boolean).join(" · ");
   const info = [...assessmentRows(d.assessment).map((a) => row({ lead: ICON.cap, title: esc(a.title), sub: esc(a.sub) })),
     coming && row({ lead: ICON.calendar, title: esc([coming.data?.n, coming.data?.topic].filter(Boolean).join(" · ")), sub: esc("Next lecture, " + dayLabel(coming.date)) }),
@@ -1006,9 +1007,10 @@ function moduleScreen(name, today) {
   else if (deck.length) html += `<p class="foot mt-12">${esc(caughtUp(nextDue(deck, today)))}</p>`;
   if (info.length) html += `<ul class="group info mt-20">${info.join("")}</ul>`;
   html += `<h2 class="section">Lectures</h2>` + (lecs.length ? `<ul class="group flat">${lecs.map((l) => {
-    const sub = [l.data?.n, l.date && dayName(l.date.slice(0, 10)), l.data?.pre && "Primer", (l.data?.post || l.user_data?.builtPost) && "Notes"].filter(Boolean).join(" · ");
+    const postId = l.data?.post || l.user_data?.builtPost, fromSlides = noteById.get(postId)?.data?.from === "slides", day = lectureDay(l);
+    const sub = [l.data?.n, day && dayName(day.slice(0, 10)), l.data?.pre && "Primer", postId && (fromSlides ? "Notes from slides" : "Notes")].filter(Boolean).join(" · ");
     return row({ tag: "button", attrs: `data-lecture="${esc(l.id)}"`, title: esc(l.data?.topic ?? l.title ?? "Lecture"), sub: esc(sub), chev: true });
-  }).join("")}</ul>` : `<p class="note-line">Lectures appear here once each one is processed.</p>`);
+  }).join("")}</ul>` : `<p class="note-line">Lectures appear here as Moodle posts their slides and recordings.</p>`);
   if (more.length) html += `<h2 class="section">More notes</h2><ul class="group flat">${more.map((x) => row({ tag: "button", attrs: `data-note="${esc(x.id)}"`,
     title: esc(x.title ?? x.data?.topic ?? "Lecture notes"), sub: x.date ? esc(dayName(x.date.slice(0, 10))) : "", chev: true })).join("")}</ul>`;
   if (qs.length) html += `<h2 class="section">Practice</h2><ul class="group flat">${qs.map((q) => row({ tag: "button", attrs: `data-practice="${esc(name)}"`,
@@ -1059,11 +1061,12 @@ function lectureScreen(id, today) {
   const deck = cards.filter((c) => c.module === lec.module && c.data?.lecture === n), dueHere = dueFor(lec.module, n);
   const qs = practice.filter((q) => q.module === lec.module && q.data?.lecture === n);
   const sections = [], body = note ? noteHtml(note, sections) : "";
-  const over = !lec.date || lec.date.slice(0, 10) < today; // ponytail: the day, not the timetable's end time as on the Mac
-  return `${head(lec.data?.topic ?? lec.title ?? "Lecture", [short(lec.module), n, lec.date && shortDay(lec.date.slice(0, 10))].filter(Boolean).join(" · "))}
+  const day = lectureDay(lec), over = !day || day.slice(0, 10) < today; // ponytail: the day, not the timetable's end time as on the Mac
+  return `${head(lec.data?.topic ?? lec.title ?? "Lecture", [short(lec.module), n, day && shortDay(day.slice(0, 10))].filter(Boolean).join(" · "))}
     ${pre && post ? `<div class="seg" role="tablist" aria-label="Which note" style="--n: 2; --i: ${usePrimer ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["Primer", true], ["Notes", false]]
       .map(([label, v]) => `<button type="button" role="tab" data-primer="${v}" aria-selected="${usePrimer === v}">${label}</button>`).join("")}</div>` : ""}
     ${toolbar(sections, url)}
+    ${note?.data?.kind === "post" && note.data.from === "slides" ? `<p class="note-line">Built from the slides. Sidebrain rebuilds these notes when the recording’s transcript arrives.</p>` : ""}
     ${body || (over ? empty(ICON.doc, "No notes yet", "Build the notes from the recording in Sidebrain on the Mac.")
                     : empty(ICON.doc, "Notes come after the lecture", "They arrive here once it has finished."))}
     ${readings?.data?.body ? `<h2 class="section">Readings</h2><div class="prose boxed">${markdown(readings.data.body)}</div>` : ""}
@@ -1087,7 +1090,7 @@ function practiceScreen(sc) {
   sc.order ??= [...all.filter((q) => !q.user_data?.attempt), ...all.filter((q) => q.user_data?.attempt)].map((q) => q.id);
   const qs = [...all].sort((a, b) => sc.order.indexOf(a.id) - sc.order.indexOf(b.id));
   return head("Practice", sc.m ?? "") + `<div class="mt-20">${qs.length ? qs.map((q) => practiceCard(q, !sc.m)).join("")
-    : empty(ICON.practice, "No practice yet", "Questions arrive the morning after each lecture.")}</div>`;
+    : empty(ICON.practice, "No practice yet", "Practice questions come with each lecture’s notes.")}</div>`;
 }
 
 /** Attempt first: the model answer stays locked until something is written, or "Skip to answer" is tapped. */
@@ -1293,7 +1296,7 @@ function demoData() {
       event("ev-gym", 1, 60, "Gym", "David Ross Sports Village"),
       event("ev-mum", 2, 30, "Call with Mum", "", 30),
       event("ev-group", 4, 90, "SM group meeting", "Hallward Library, room 3"),
-      event("ev-hyrox", 6, 45, "Hyrox class", "Jubilee Sports Centre"),
+      event("ev-spin", 6, 45, "Spin class", "Jubilee Sports Centre"),
       { id: "ev-fair", title: "Careers fair week", date: day(-2), data: { title: "Careers fair week", allDay: true, start: `${day(-2)}T00:00:00+01:00`, end: `${day(3)}T00:00:00+01:00` }, user_data: {} }, // began before today, still on
     ].filter(Boolean),
     assessments: [
@@ -1303,11 +1306,11 @@ function demoData() {
       assess("assess-sm-exam", sm, day(100), { title: "Exam", weight: "70%" }),
     ],
     tasks: [
-      task("you-demo-1", day(-1), "Email Dr Amess about the essay question", "You"),
+      task("you-demo-1", day(-1), "Email Dr Lane about the essay question", "You"),
       task("you-demo-13", day(1), "Outline the CRG essay", "You"), // the brief's priority, so its card gets the tick
       task("auto-demo-7", day(-3), "Return the library books", "Uni mail"),
       task("auto-demo-2", t, "Read Jensen & Meckling (1976) before the seminar", "Lectures"),
-      task("auto-voice-demo-6", t, "Call the accommodation office", "VoiceType", {}, { remindAt: clockAt("17:30") }),
+      task("auto-voice-demo-6", t, "Call the accommodation office", "You", {}, { remindAt: clockAt("17:30") }),
       task("auto-demo-3", day(2), "Book a library group room", "Uni mail"),
       task("you-demo-8", day(-2), "Draft the Orbis cover letter", "You", { doDate: day(3) }),
       task("you-demo-4", null, "Renew railcard", "You"),
@@ -1325,7 +1328,7 @@ function demoData() {
       { id: "app-demo-jpm", title: null, date: day(5), data: { org: "JPMorgan", role: "Off-cycle", status: "rejected" }, user_data: {} },             // R3
     ],
     notes: [
-      { id: "you-demo-n1", source: "you", title: "Ask Dr Amess", data: { body: "Ask Dr Amess if the essay can use 2025 annual reports" }, user_data: {}, created_at: daysAgo(2 / 24) },
+      { id: "you-demo-n1", source: "you", title: "Ask Dr Lane", data: { body: "Ask Dr Lane if the essay can use 2025 annual reports" }, user_data: {}, created_at: daysAgo(2 / 24) },
       { id: "you-demo-n2", source: "you", title: "Agency costs", data: { body: "Agency costs = monitoring + bonding + residual loss (seminar board)" }, user_data: {}, created_at: daysAgo(26 / 24) },
       { id: "you-demo-n3", source: "you", title: "Compare Tesco", data: { body: "Compare Tesco and Sainsbury’s board structures for the essay" }, user_data: {}, created_at: daysAgo(2.2) },
       { id: "you-demo-n4", source: "you", title: "Room change", data: { body: "SM seminar moves to B32 from next week" }, user_data: {}, created_at: daysAgo(3.1) },
@@ -1379,8 +1382,8 @@ function demoStudy(t, day) {
   ] };
   return {
     modules: [
-      { id: "mod-crg", module: crg, title: crg, data: { code: "BUSI3028", short: "CRG", convenor: "Prof Kevin Amess", assessment: "Exam, 2 hours, 100%, 2 essays from 6, January", next: "L2 Wed 10:00 · Jensen & Meckling model · exam 100%" } },
-      { id: "mod-sm", module: sm, title: sm, data: { code: "BUSI3186", short: "SM", convenor: "Dr Andrew Wild", assessment: "Group video 30% due 10 Dec · case study 70% due 13 May", next: "L2 Fri 09:00 · External analysis" } },
+      { id: "mod-crg", module: crg, title: crg, data: { code: "BUSI3028", short: "CRG", convenor: "Dr Sarah Lane", assessment: "Exam, 2 hours, 100%, 2 essays from 6, January", next: "L2 Wed 10:00 · Jensen & Meckling model · exam 100%" } },
+      { id: "mod-sm", module: sm, title: sm, data: { code: "BUSI3186", short: "SM", convenor: "Dr Tom Hale", assessment: "Group video 30% due 10 Dec · case study 70% due 13 May", next: "L2 Fri 09:00 · External analysis" } },
     ],
     lectures: [
       { id: "lec-crg-l1", module: crg, date: day(-6), title: null, data: { n: "L1", topic: "Why corporate governance exists", pre: "auto-pre-crg-l1", post: "auto-post-crg-l1" }, user_data: {} },

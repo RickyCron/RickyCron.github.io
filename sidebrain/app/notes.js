@@ -226,3 +226,6 @@ const number = (n) => Number(String(n ?? "").replace(/\D/g, "")) || 0;
 /** Newest first: higher lecture number, then later date (StudyModel.ordered). */
 export const ordered = (lectures) => [...lectures].sort((a, b) =>
   number(b.data?.n) - number(a.data?.n) || ((b.date ?? "") > (a.date ?? "") ? 1 : (b.date ?? "") < (a.date ?? "") ? -1 : 0));
+/** A lecture's own day, null when it is only the day its slides went up (data.dated "posted"), so that day is never shown
+ *  or taken for the next lecture (StudyModel.lectureDay). */
+export const lectureDay = (l) => (l?.data?.dated === "posted" ? null : l?.date ?? null);
