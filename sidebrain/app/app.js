@@ -4,8 +4,9 @@
 // write is merged into the row's user_data and carries `userAt`, so the server can keep the newer one.
 // Writes go through a small outbox in localStorage, so a review on a train with no signal is never lost.
 import { schedule, intervalLabel, due, nextDue, examDays, todayString, daysBetween, addDays } from "./sm2.js";
-import { withoutGreeting, dueSoon, dueLabel, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS } from "./today.js";
-import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay } from "./notes.js";
+import { withoutGreeting, dueSoon, dueLabel, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS,
+         upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock } from "./today.js";
+import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay, TICK } from "./notes.js";
 
 // ---- Settings to fill in before publishing (web/(C) README.md) ----
 const SUPABASE_URL = "https://rdwavprncthvujmckige.supabase.co";
@@ -33,7 +34,7 @@ const load = (k, fallback) => { try { return JSON.parse(localStorage.getItem(PRE
 const keep = (k, v) => { try { localStorage.setItem(PREFIX + k, JSON.stringify(v)); } catch { /* private mode: the app still works, just without the offline copy */ } };
 
 let sb = null, user = null;
-let cards = [], byId = new Map(), assessments = [], tasks = [], applications = [], events = [], brief = null, notes = [];
+let cards = [], byId = new Map(), assessments = [], tasks = [], applications = [], events = [], brief = null, notes = [], pings = [];
 let modules = [], lectures = [], practice = [], noteById = new Map(); // Study: lecture notes are `note` items, by id
 let thumbs = new Map();              // photo path → signed URL (or a data URL in demo), for capture thumbnails
 let outbox = load("outbox", []);     // [{t: "review" | "tick" | "edit" | "attempt", id, user_data, activity?} | {t: "note" | "add", row}], oldest first
@@ -44,7 +45,7 @@ const photos = { capture: null, add: null }; // the photo waiting in each compos
 // Today's view state.
 const held = new Map();     // task id → {kind: "done" | "gone", at, timer}: shown (ticked or leaving) until it collapses
 const datesShown = new Set(); // coursework ids showing their date instead of the countdown
-let openSlipped = false, openEarlier = false, allDue = false, allEvents = false, sheetTask = null;
+let openSlipped = false, openEarlier = false, allDue = false, allEvents = false, allNext = false, sheetTask = null, sheetPing = null;
 let addMode = "todo", todoIgnore = new Set(), todoParse = null, todoManual = null;
 const session = { queue: [], index: 0, flipped: false, grades: [0, 0, 0, 0], day: "", module: null, lecture: null };
 // Study screens, pushed and popped inside the tab like the Mac's StudyView: {s: "home" | "module" | "lecture" | "note" |
@@ -70,11 +71,13 @@ async function start() {
     reminders = load("reminders", false) ? "on" : "off";
     synced = Date.now();
     useData(DEMO_MODE === "empty" ? {} : demoData());
-    return render();
+    render();
+    return routePending(true);
   }
   const cached = load("cache", null);
   if (cached && load("user", null)) { user = load("user", null); useData({ ...cached, lectureNotes: load("lecture-notes", []) }); }
   render();
+  if (loaded) routePending(false); // the cached copy, when it already has what the link points at
   await connect();
 }
 
@@ -100,7 +103,7 @@ async function connect() {
 }
 
 function signedOut() {
-  user = null; cards = []; byId = new Map(); tasks = []; applications = []; events = []; brief = null; notes = []; loaded = false;
+  user = null; cards = []; byId = new Map(); tasks = []; applications = []; events = []; brief = null; notes = []; pings = []; loaded = false;
   modules = []; lectures = []; practice = []; noteById = new Map(); stack = [{ s: "home" }]; reviewing = false;
   localStorage.removeItem(PREFIX + "user"); // the outbox stays, and syncs after the next sign-in
   render();
@@ -134,22 +137,25 @@ async function refresh() {
   tried = Date.now();
   try {
     const today = todayString();
-    const [c, a, t, ap, ev, b, n, mo, le, pr, ln] = await Promise.all([
+    const [c, a, t, ap, ev, b, n, mo, le, pr, ln, pg] = await Promise.all([
       all("card", "id,module,title,data,user_data,updated_at"), all("assessment", "id,source,module,title,data,date,user_data"),
       all("task", "id,source,title,date,data,user_data,created_at,updated_at"), all("application", "id,title,date,data,user_data"),
-      run(items("event", "id,title,date,data,user_data").gte("date", addDays(today, -14)).lte("date", today)), // earlier ones may still be running
+      run(items("event", "id,title,date,data,user_data").gte("date", addDays(today, -14)).lte("date", addDays(today, 7))), // earlier ones may still be running; Up next runs to Sunday
       run(items("brief", "id,date,data").eq("date", today).limit(1)),
       run(items("quicknote", "id,source,title,data,user_data,created_at").order("created_at", { ascending: false }).limit(50)),
       all("module", "id,module,title,data"), all("lecture", "id,module,date,title,data,user_data"),
-      all("practice", "id,module,title,data,user_data,updated_at"), all("note", "id,module,date,title,data"),
+      all("practice", "id,module,title,data,user_data,updated_at"), all("note", "id,module,date,title,data,user_data,updated_at"),
+      // ponytail: the last 30 days of pings; page further back if the Inbox ever needs older ones.
+      run(items("ping", "id,title,date,data,user_data,updated_at").gte("date", addDays(today, -30)).lte("date", addDays(today, 7))),
     ]);
-    const fresh = { cards: c, assessments: a, tasks: t, applications: ap, events: ev, brief: b[0] ?? null, notes: n, modules: mo, lectures: le, practice: pr };
+    const fresh = { cards: c, assessments: a, tasks: t, applications: ap, events: ev, brief: b[0] ?? null, notes: n, modules: mo, lectures: le, practice: pr, pings: pg };
     // Lecture notes are the bulk (~25 KB each with their doc), so they get their own key: if they ever outgrow
     // localStorage, only offline reading is lost, never the cards and the outbox.
     // ponytail: localStorage for notes; move them to IndexedDB if a term's worth stops fitting (about 5 MB).
-    keep("lecture-notes", ln);
     useData({ ...fresh, lectureNotes: ln });
-    keep("cache", { cards, assessments, tasks, applications, events, brief, notes, modules, lectures, practice }); // merged, so a write made during the fetch stays
+    for (const [k, v] of blobs) if (v === false) blobs.delete(k); // a failed download tries again on the next refresh
+    keep("lecture-notes", [...noteById.values()]); // merged, so a guess or a tick made during the fetch stays
+    saveCache(); // merged, so a write made during the fetch stays
     cloud = ""; syncError = "";
     synced = Date.now(); keep("synced", synced);
     signThumbs();
@@ -157,6 +163,7 @@ async function refresh() {
     cloud = loaded ? "Couldn’t reach Sidebrain. Showing what’s saved on this phone." : `Couldn’t load: ${e.message || "network error"}`;
   }
   render();
+  routePending(true);
   flush();
   reminders = await reminderStatus();
   render();
@@ -186,13 +193,13 @@ function useData(d) {
   tasks = withPending(merge([...(d.tasks ?? []).filter((x) => !added.some((a) => a.id === x.id)), ...added], tasks));
   assessments = d.assessments ?? []; applications = d.applications ?? []; events = d.events ?? []; brief = d.brief ?? null; notes = d.notes ?? [];
   modules = [...(d.modules ?? [])].sort((a, b) => ((a.data?.code ?? "") < (b.data?.code ?? "") ? -1 : 1));
-  lectures = d.lectures ?? []; practice = withPending(merge(d.practice, practice));
-  noteById = new Map((d.lectureNotes ?? []).map((x) => [x.id, x]));
+  lectures = d.lectures ?? []; practice = withPending(merge(d.practice, practice)); pings = withPending(merge(d.pings, pings));
+  noteById = new Map(withPending(merge(d.lectureNotes, [...noteById.values()])).map((x) => [x.id, x]));
   loaded = true;
   if (!reviewing && (session.index === 0 || session.day !== todayString())) newSession(); // never reshuffle a session in progress, even on its first card
 }
 
-const saveCache = () => { if (!DEMO) keep("cache", { cards, assessments, tasks, applications, events, brief, notes, modules, lectures, practice }); };
+const saveCache = () => { if (!DEMO) keep("cache", { cards, assessments, tasks, applications, events, brief, notes, modules, lectures, practice, pings }); };
 
 // ---------- Writes ----------
 
@@ -205,6 +212,7 @@ function writeUser(item, patch, t, act = null) {
   outbox.push({ t, id: item.id, user_data: item.user_data, activity: act, before });
   keep("outbox", outbox);
   saveCache();
+  if (!DEMO && noteById.has(item.id)) keep("lecture-notes", [...noteById.values()]);
   flush();
 }
 
@@ -351,7 +359,7 @@ function rollback(op) {
     tasks = tasks.filter((x) => x.id !== op.row.id);
     captures = captures.filter((x) => x.id !== op.row.id); keep("captures", captures);
   } else if (!outbox.slice(1).some((o) => o.id === op.id)) {
-    const item = [...cards, ...tasks, ...practice].find((x) => x.id === op.id);
+    const item = [...cards, ...tasks, ...practice, ...pings, ...noteById.values()].find((x) => x.id === op.id);
     if (item) item.user_data = op.before ?? {};
   }
   saveCache();
@@ -372,7 +380,7 @@ async function shrink(file, max = 1600) {
 const dataUrl = (blob) => new Promise((ok, fail) => Object.assign(new FileReader(), { onload: (e) => ok(e.target.result), onerror: fail }).readAsDataURL(blob));
 
 /** The one capture path, for the Capture tab and the Add sheet. True when the note was saved. */
-async function capture(body, file, status) {
+async function capture(body, file, status, cls = null) {
   if (!body && !file) { say(status, "Write something or add a photo first.", true); return false; }
   const id = "you-" + crypto.randomUUID(); // Store.addOwn's id shape
   try {
@@ -389,8 +397,8 @@ async function capture(body, file, status) {
       }
     }
     // ponytail: a photo can't wait in the outbox (localStorage is too small); keep it in IndexedDB if offline photos matter.
-    const row = { id, kind: "quicknote", source: "you", module: null, date: null, title: titleOf(body),
-                  data: photo ? { body, photo } : { body }, user_data: {}, deleted_at: null };
+    const row = { id, kind: "quicknote", source: "you", module: cls?.module ?? null, date: null, title: titleOf(body),
+                  data: { body, ...(photo ? { photo } : {}), ...(cls?.lecture ? { lecture: cls.lecture } : {}) }, user_data: {}, deleted_at: null };
     outbox.push({ t: "note", row });
     keep("outbox", outbox);
     captures = [{ id, body, photo: !!photo, thumb, at: Date.now() }, ...captures].slice(0, 20);
@@ -409,7 +417,7 @@ async function capture(body, file, status) {
 async function saveCompose(form) {
   const name = form.dataset.compose, button = form.querySelector("[type=submit]"), status = form.querySelector("[role=status]");
   button.disabled = true;
-  const ok = await capture(form.elements.body.value.trim(), photos[name], status);
+  const ok = await capture(form.elements.body.value.trim(), photos[name], status, name === "add" ? captureFor : null);
   if (ok) { form.elements.body.value = ""; setPhoto(form, null); }
   canSave(form);
   if (ok && name === "add") $("add-sheet").close();
@@ -574,25 +582,25 @@ function paint(el, html) {
 
 const top = () => stack[stack.length - 1];
 
+const TABS = ["today", "study", "inbox", "capture"];
 function render() {
   const signedIn = !!user, today = todayString(), root = document.documentElement;
   const pushed = signedIn && tab === "study" && stack.length > 1;
   root.classList.toggle("reviewing", signedIn && reviewing);
   $("signin").hidden = signedIn;
   $("dock").hidden = !signedIn;
-  for (const t of ["today", "study", "capture"]) $(t).hidden = !signedIn || tab !== t;
+  for (const t of TABS) $(t).hidden = !signedIn || tab !== t;
   $("review").hidden = !(signedIn && reviewing);
   $("back").hidden = !pushed;
   $("account").hidden = !signedIn || pushed;
   $("account").textContent = (user?.email || "?")[0].toUpperCase();
-  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", capture: "Capture" }[tab];
-  const tabs = ["today", "study", "capture"];
-  $("tabs").style.setProperty("--i", tabs.indexOf(tab));
+  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", capture: "Capture", inbox: "Inbox" }[tab];
+  $("tabs").style.setProperty("--i", TABS.indexOf(tab));
   for (const b of $("tabs").querySelectorAll("button")) {
     if (b.dataset.tab === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   }
   if (signedIn && loaded) navigator.setAppBadge?.(due(cards, today).length).catch(() => {});
-  if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderSheet(); }
+  if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderInbox(); renderSheet(); }
   $("contents").hidden = !pushed || !screenSections.length;
   if ($("contents").hidden) setContents(false);
   watchTitle();
@@ -634,8 +642,10 @@ const ICON = {
   list: svg(`<path d="M9 7h11M9 12h11M9 17h11M4.5 7h.01M4.5 12h.01M4.5 17h.01"/>`),
   open: svg(`<path d="M9.5 6.25h8.25v8.25M17.5 6.5L6.25 17.75"/>`),
   close: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>`,
+  more: `<svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.1"/><circle cx="12" cy="12" r="1.1"/><circle cx="18" cy="12" r="1.1"/></svg>`,
+  play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M8 5.5v13l10.5-6.5z"/></svg>`,
+  pause: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 5.75v12.5M15.5 5.75v12.5"/></svg>`,
 };
-const TICK = `<svg viewBox="0 0 22 22" aria-hidden="true"><circle class="ring" cx="11" cy="11" r="10.25"/><circle class="disc" cx="11" cy="11" r="11"/><path class="check" d="M6.6 11.4l3 3 5.8-6.3" pathLength="1"/></svg>`;
 
 /** A list row. `tag` is button for tappable rows; `lead` is a glyph (or a time); `trail` is a value; `chev` a disclosure. */
 function row({ tag = "div", attrs = "", lead = "", title, sub = "", trail = "", chev = false, cls = "", titleCls = "", trailCls = "" }) {
@@ -659,7 +669,7 @@ const countdown = (days) => (days < 14 ? `${days} days` : `${Math.floor(days / 7
 const dayName = (day, today = todayString()) => (day === today ? "Today" : day === addDays(today, 1) ? "Tomorrow" : shortDay(day) + (day.slice(0, 4) !== today.slice(0, 4) ? " " + day.slice(0, 4) : ""));
 const nextMonday = (today) => parseWhen("next week", today).date;
 const norm = (t) => String(t ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-const notices = () => [syncError && `<p class="foot warn">${esc(syncError)}</p>`, cloud && `<p class="foot">${esc(cloud)}</p>`].filter(Boolean).join("");
+const notices = () => [syncError && `<p class="foot warn">${esc(syncError)}</p>`, routeNote && `<p class="foot warn">${esc(routeNote)}</p>`, cloud && `<p class="foot">${esc(cloud)}</p>`].filter(Boolean).join("");
 /** Due soon's trailing value: "17:30" or "Today", "Tomorrow", the weekday 2 to 6 days out ("Fri"), then "Wed 14 Oct". */
 function dueText(r) {
   if (r.slipped) return shortDay(r.date);
@@ -692,8 +702,11 @@ function renderToday(today) {
   const caps = captureList();
   const hasSchedule = sched.allDay.length || sched.past.length || sched.now.length || sched.next.length;
   const foot = `<p class="foot mt-28" id="today-foot"></p>`;
+  // Up next, now to Sunday. Today's classes are already in Schedule, so they aren't repeated here.
+  const ahead = upNext({ events, pings, tasks, assessments, notes: [...noteById.values()] }, new Date(now)).filter((r) => !(r.event && r.day === today && hasSchedule));
+  const briefAt = new Map([...noteById.values()].filter((n) => n.data?.kind === "pre" && Date.parse(n.data?.classAt)).map((n) => [Date.parse(n.data.classAt), n]));
 
-  if (!hasSchedule && !p && !cardsDue && !rows.length && !later.length && !caps.length) {
+  if (!hasSchedule && !ahead.length && !p && !cardsDue && !rows.length && !later.length && !caps.length) {
     paint($("today"), top + empty(ICON.sun, "Nothing due", "Deadlines, lectures and to-dos from the Mac show up here.",
       `<button class="btn secondary" type="button" data-act="add">Add a to-do</button>`).replace('class="empty"', 'class="empty fill"') + foot);
     return updateFoot();
@@ -702,7 +715,9 @@ function renderToday(today) {
   let html = top;
   if (hasSchedule) {
     const time = (t) => `<span class="time">${t}</span>`;
-    const event = (e, trail = "") => row({ lead: time(e.time), title: esc(e.title), sub: esc(e.location), trail, cls: e.state === "past" ? "past" : "" });
+    const event = (e, trail = "") => { const b = briefAt.get(e.start.getTime());
+      return row({ tag: b ? "button" : "div", attrs: `data-item="${esc(e.id)}"${b ? ` data-open="note:${esc(b.id)}"` : ""}`, lead: time(e.time), title: esc(e.title),
+        sub: esc([b && briefLabel(b), e.location].filter(Boolean).join(" · ")), trail, cls: e.state === "past" ? "past" : "", chev: !!b }); };
     html += `<h2 class="section">Schedule</h2><ul class="group times">
       ${sched.allDay.length ? row({ lead: time("All day"), title: esc(sched.allDay.join(", ")), titleCls: "one" }) : ""}
       ${sched.past.length ? row({ tag: "button", attrs: `data-act="earlier" aria-expanded="${openEarlier}"`, lead: time(""), title: `${sched.past.length} earlier`, cls: "fold", chev: true }) : ""}
@@ -712,6 +727,14 @@ function renderToday(today) {
       ${!sched.now.length && !sched.next.length ? row({ lead: time(""), title: "Nothing else today", cls: "quiet" }) : ""}
       ${sched.more ? row({ tag: "button", attrs: `data-act="all-events"`, title: allEvents ? "Show less" : "Show all", cls: "more" }) : ""}
     </ul>`;
+  }
+  if (ahead.length) {
+    const label = (r) => (r.day === today ? "Today" : r.day === addDays(today, 1) ? "Tomorrow" : WEEKDAYS[new Date(r.day + "T12:00").getDay()]);
+    html += `<h2 class="section">Up next</h2><ul class="group times">${(allNext ? ahead : ahead.slice(0, 5)).map((r) => row({
+      tag: r.open ? "button" : "div", attrs: `data-next="${esc(r.id)}"${r.open ? ` data-open="${esc(r.open)}"` : ""}`,
+      lead: `<span class="time">${r.time ?? (r.kind === "assessment" ? "Due" : "All day")}</span>`, title: esc(r.title), titleCls: "clamp",
+      sub: esc(shorten(r.sub)), trail: label(r), chev: !!r.open })).join("")}
+      ${ahead.length > 5 ? row({ tag: "button", attrs: `data-act="all-next"`, title: allNext ? "Show less" : "Show all", cls: "more" }) : ""}</ul>`;
   }
   if (p) {
     const why = typeof p.why === "string" ? withoutGreeting(p.why) : "";
@@ -767,7 +790,7 @@ function dueRow(r, now) {
   const label = dueText(r), sub = r.kind === "task" ? held.get(r.id)?.note ?? "" : shorten(r.detail);
   const text = `<span class="text"><span class="title clamp">${esc(r.title)}</span>${sub ? `<span class="subtitle">${esc(sub)}</span>` : ""}</span>`
     + (label ? `<span class="trail${r.slipped ? " warn" : ""}">${esc(label)}</span>` : "");
-  if (r.kind !== "task") return `<li><div class="row">${r.kind === "application" ? ICON.briefcase : ICON.cap}${text}</div></li>`;
+  if (r.kind !== "task") return `<li data-item="${esc(r.id)}"><div class="row">${r.kind === "application" ? ICON.briefcase : ICON.cap}${text}</div></li>`;
   const h = held.get(r.id), done = h?.kind === "done", task = tasks.find((t) => t.id === r.id);
   const cls = ["task", done && "done", done && now - h.at < 450 && "just", task?.fresh && now - task.fresh < 450 && "fresh"].filter(Boolean).join(" ");
   return `<li class="${cls}" data-row="${esc(r.id)}">${tickButton(r.id, r.title, done)}<button class="row" type="button" data-task="${esc(r.id)}">${text}</button></li>`;
@@ -802,7 +825,218 @@ function openTaskSheet(id) {
   $("task-sheet").showModal();
 }
 
+// ---------- Inbox: every ping that has fired (docs/(C) Brief + ping contract.md §6) ----------
+
+function renderInbox() {
+  const { rows, unread } = inbox(pings, new Date());
+  $("inbox-badge").textContent = unread > 99 ? "99+" : String(unread);
+  $("inbox-badge").hidden = !unread;
+  $("tabs").querySelector('[data-tab="inbox"]').setAttribute("aria-label", unread ? `Inbox, ${unread} unread` : "Inbox");
+  const top = head("Inbox") + notices();
+  if (!loaded) return paint($("inbox"), top + SKELETON);
+  if (!rows.length) return paint($("inbox"), top + empty(ICON.bell, "No notifications yet", "Briefs, deadlines and reminders collect here as they arrive."));
+  paint($("inbox"), top + `<ul class="group inbox mt-20">${rows.map((x) => {
+    const done = x.user_data?.done === true, fresh = !x.user_data?.seenAt && !done, at = fireAt(x);
+    const sub = [when(at.getTime()) + (localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)), done && "Done"].filter(Boolean).join(" · ");
+    return `<li class="ping${done ? " done" : ""}" data-item="${esc(x.id)}">${fresh ? `<i class="dot" aria-hidden="true"></i>` : ""}
+      <button class="row" type="button" data-ping="${esc(x.id)}" aria-label="${fresh ? "Unread. " : ""}${esc(x.title ?? "")}, ${esc(sub)}"><span class="text"><span class="title${fresh ? " strong" : ""}">${esc(x.title ?? "Notification")}</span><span class="subtitle">${esc(sub)}</span></span></button>
+      <button class="more-btn" type="button" data-pmore="${esc(x.id)}" aria-label="Snooze or done: ${esc(x.title ?? "")}">${ICON.more}</button></li>`;
+  }).join("")}</ul>`);
+}
+
+/** A ping's sheet: Snooze (1 h, 20:00 tonight, 08:00 tomorrow) and Done. Both mark it seen. */
+function openPingSheet(id) {
+  const p = pings.find((x) => x.id === id);
+  if (!p) return;
+  sheetPing = id;
+  const done = p.user_data?.done === true;
+  say("ping-title", p.title ?? "Notification");
+  const at = fireAt(p);
+  say("ping-when", at ? `${when(at.getTime())}${localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)}` : "");
+  $("ping-moves").innerHTML = snoozeChoices(new Date()).map(([label, d]) =>
+    row({ tag: "button", attrs: `data-snooze="${d.toISOString().replace(/\.\d{3}Z$/, "Z")}"`, lead: ICON.clock, title: label, trail: clock(d) })).join("");
+  say("ping-done-label", done ? "Mark as not done" : "Done");
+  $("ping-sheet").showModal();
+}
+
+/** Open, Done and Snooze write user_data (with userAt, as every write does). Open and Done mark the ping seen; Snooze
+ *  clears seenAt, so it comes back unread when it fires again (as on the Mac). */
+function pingWrite(id, patch) {
+  const p = pings.find((x) => x.id === id);
+  if (!p) return null;
+  writeUser(p, { ...(p.user_data?.seenAt ? {} : { seenAt: Date.now() }), ...patch }, "edit");
+  return p;
+}
+function openPing(id) {
+  const p = pingWrite(id, {});
+  render();
+  if (p && typeof p.data?.open === "string" && !openTarget(p.data.open)) tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
+}
+
+// ---------- Opening a target: ?open=, a notification tap, Up next and the Inbox (contract §3) ----------
+
+let routeNote = "";
+const tell = (text) => { routeNote = text; render(); };
+// The link this launch came with. It's taken off the address, so a reload doesn't open it again.
+let pending = null, pendingPing = null;
+takeLink(location.href);
+function takeLink(href) {
+  const url = new URL(href, location.href);
+  pending = url.searchParams.get("open") ?? pending; pendingPing = url.searchParams.get("ping") ?? pendingPing;
+  url.searchParams.delete("open"); url.searchParams.delete("ping");
+  if (href === location.href) history.replaceState(null, "", url.pathname + url.search + url.hash);
+}
+/** Opens the pending link once the data has what it points at; `final` (fresh data, or none coming) gives up with a note. */
+function routePending(final) {
+  if (pendingPing && (pings.some((x) => x.id === pendingPing) || final)) { pingWrite(pendingPing, {}); pendingPing = null; }
+  if (!pending) return;
+  if (openTarget(pending)) pending = null;
+  else if (final) { pending = null; tell("That isn’t on this phone yet. It arrives with the next sync from the Mac."); }
+}
+
+/** Shows a target. False when what it points at isn't here. */
+function openTarget(target) {
+  const t = String(target ?? ""), at = t.indexOf(":"), kind = t.slice(0, at), id = t.slice(at + 1);
+  if (at < 1) return false;
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  reviewing = false;
+  routeNote = "";
+  if (kind === "url") {
+    if (!/^https:\/\//i.test(id)) return true; // only web links leave the app
+    const w = window.open(id, "_blank");
+    if (w) { w.opener = null; return true; }
+    switchTab("inbox"); // a link opened without a tap is blocked: the Inbox's Open is a tap
+    return true;
+  }
+  if (kind === "item") {
+    switchTab("today");
+    // Its own card: a task's Due soon row, else Schedule or Due soon, Coursework, then Up next.
+    const el = ["row", "item", "cw", "next"].map((a) => $("today").querySelector(`[data-${a}="${CSS.escape(id)}"]`)).find(Boolean);
+    if (!el) return false;
+    el.scrollIntoView({ block: "center", behavior: still() ? "auto" : "smooth" });
+    el.classList.add("spot");
+    setTimeout(() => el.classList.remove("spot"), 1600);
+    return true;
+  }
+  if (kind === "lecture") {
+    const lec = lectures.find((l) => l.id === id);
+    return !!lec && (study([{ s: "module", m: lec.module }, { s: "lecture", id }]), true);
+  }
+  if (!["note", "reask", "listen"].includes(kind)) return false;
+  const n = id === "next" ? nextBrief([...noteById.values()]) : noteById.get(id);
+  if (!n) return false;
+  foldsFor(n.id).reask = kind === "reask";
+  const lec = lectures.find((l) => [l.data?.pre, l.data?.post, l.user_data?.builtPost].includes(n.id));
+  if (lec) primer.set(lec.id, lec.data?.pre === n.id);
+  study(lec ? [{ s: "module", m: lec.module }, { s: "lecture", id: lec.id }] : [...(n.module ? [{ s: "module", m: n.module }] : []), { s: "note", id: n.id }]);
+  const el = kind === "reask" ? $("study").querySelector(".preq") : kind === "listen" ? $("study").querySelector("[data-play]") : null;
+  el?.scrollIntoView({ block: "start" });
+  if (el) scrollBy(0, -60);
+  if (kind === "listen") el?.focus({ preventScroll: true });
+  return true;
+}
+/** Study, at these screens under its home. */
+function study(screens) {
+  setContents(false);
+  tabY[tab] = scrollY;
+  tab = "study";
+  stack = [{ s: "home" }, ...screens];
+  render();
+  scrollTo(0, 0);
+}
+
+// ---------- Listening to a brief (contract §4) ----------
+
+// One <audio> for the app, outside the page, so redraws never stop it. The recording is downloaded ahead (from the
+// private `audio` bucket, as a blob), because iOS only starts playback inside the tap itself.
+const audio = new Audio();
+const blobs = new Map();   // storage path → blob URL, null while it downloads, false when it couldn't
+const player = { id: null, version: "short", playing: false, started: false, speech: false };
+let speed = load("speed", 1);
+const SPEEDS = [1, 1.25, 1.5, 2];
+
+// Keyed by path and script hash: the Mac re-uploads a changed script to the same path.
+const recording = (n, version) => { const p = n.user_data?.audio?.[version]; return typeof p === "string" && p ? p + "#" + (n.user_data.audio.hash ?? "") : null; };
+const script = (n, version) => { const s = n.data?.audio?.[version]?.script; return typeof s === "string" ? s.trim() : ""; };
+const briefTitle = (n) => (Array.isArray(n.data?.doc?.blocks) ? n.data.doc.blocks : []).find((b) => b?.t === "h1" && b.text)?.text ?? n.title ?? "Brief";
+
+function prefetch(path) {
+  if (!path || blobs.has(path) || DEMO || !sb) return;
+  blobs.set(path, null);
+  sb.storage.from("audio").download(path.split("#")[0])
+    .then(({ data, error }) => { if (error || !data) throw error; blobs.set(path, URL.createObjectURL(data)); })
+    .catch(() => blobs.set(path, false)) // the phone's own voice reads it instead
+    .finally(render);
+}
+
+/** The player above a brief that has audio scripts or a recording: Play, Short or Full, and speed. */
+function playerHtml(n) {
+  const version = player.id === n.id ? player.version : "short", path = recording(n, version);
+  if (!path && !script(n, "short") && !script(n, "full")) return "";
+  prefetch(path);
+  const mine = player.id === n.id, file = path ? blobs.get(path) : false, waiting = file === null;
+  const label = mine && player.playing ? "Pause" : waiting ? "Loading…" : mine && player.started ? "Resume" : "Play";
+  const both = (recording(n, "short") || script(n, "short")) && (recording(n, "full") || script(n, "full"));
+  return `<div class="player" data-player="${esc(n.id)}">
+    <button class="btn primary" type="button" data-play="${esc(n.id)}"${waiting ? " disabled" : ""}>${mine && player.playing ? ICON.pause : ICON.play}${label}</button>
+    <div class="player-row">${both ? `<div class="seg" role="tablist" aria-label="Which version" style="--n: 2; --i: ${version === "short" ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["short", "Short"], ["full", "Full"]]
+      .map(([v, l]) => `<button type="button" role="tab" data-ver="${v}" aria-selected="${version === v}">${l}</button>`).join("")}</div>` : ""}
+      <button class="btn secondary small" type="button" data-speed aria-label="Speed ${speed} times">${speed}×</button></div>
+    ${file === false ? `<p class="foot">${path ? "Couldn’t load the recording, so" : "No recording yet, so"} the phone’s voice reads it.</p>` : ""}
+  </div>`;
+}
+
+function stopAudio() {
+  audio.pause();
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  Object.assign(player, { playing: false, started: false, speech: false });
+}
+
+/** Play, pause or resume, all inside the tap: the downloaded recording, else the script in the phone's own voice. */
+function togglePlay(id) {
+  const n = noteById.get(id);
+  if (!n) return;
+  if (player.id === id && player.started) {
+    if (player.playing) player.speech ? speechSynthesis.pause() : audio.pause();
+    else player.speech ? speechSynthesis.resume() : audio.play().catch(() => {});
+    player.playing = !player.playing;
+    return render();
+  }
+  const version = player.id === id ? player.version : "short", url = blobs.get(recording(n, version));
+  stopAudio();
+  Object.assign(player, { id, version, playing: true, started: true, speech: !url });
+  if (url) {
+    audio.src = url; audio.playbackRate = speed;
+    audio.play().catch(() => { player.playing = player.started = false; render(); });
+    lockScreen(n);
+  } else if ("speechSynthesis" in window && script(n, version)) {
+    const u = Object.assign(new SpeechSynthesisUtterance(script(n, version)), { lang: "en-GB", rate: speed });
+    u.onend = () => { if (player.id === id) { player.playing = player.started = false; render(); } };
+    speechSynthesis.speak(u);
+  } else player.playing = player.started = false;
+  render();
+}
+
+/** Lock-screen and headphone controls: title, module, play and pause, and 15 s back and forward. */
+function lockScreen(n) {
+  const ms = navigator.mediaSession;
+  if (!ms) return;
+  ms.metadata = new MediaMetadata({ title: briefTitle(n), artist: n.module ?? "Sidebrain", artwork: [{ src: "icon-512.png", sizes: "512x512", type: "image/png" }] });
+  const on = (action, fn) => { try { ms.setActionHandler(action, fn); } catch { /* not supported here */ } };
+  const seek = (by) => { audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + by)); };
+  on("play", () => audio.play()); on("pause", () => audio.pause());
+  on("seekbackward", (e) => seek(-(e.seekOffset || 15))); on("seekforward", (e) => seek(e.seekOffset || 15));
+  on("seekto", (e) => { audio.currentTime = e.seekTime; });
+}
+const position = () => { try { if (Number.isFinite(audio.duration)) navigator.mediaSession?.setPositionState?.({ duration: audio.duration, playbackRate: audio.playbackRate, position: audio.currentTime }); } catch { /* ignore */ } };
+audio.onplay = () => { player.playing = true; position(); if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing"; render(); };
+audio.onpause = () => { player.playing = false; position(); if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused"; render(); };
+audio.onended = () => { player.playing = player.started = false; render(); };
+audio.onratechange = audio.onseeked = audio.onloadedmetadata = position;
+
 // ---------- Add (To-do | Note) ----------
+
+let captureFor = null; // {module, lecture}: the Add sheet's note goes to this class (a lecture's "Note for this class")
 
 function openAdd(mode = "todo") {
   for (const el of $("add-sheet").querySelectorAll("[role=status]")) say(el, "");
@@ -960,15 +1194,20 @@ function renderStudy(today) {
   const html = !loaded ? head("Study") + SKELETON : sc.s === "module" ? moduleScreen(sc.m, today) : sc.s === "lecture" ? lectureScreen(sc.id, today)
     : sc.s === "note" ? noteScreen(sc.id) : sc.s === "practice" ? practiceScreen(sc) : homeScreen(today);
   if ($("study")._html === html) return; // nothing new: leave the page alone, so typing, focus and open menus survive
-  const a = document.activeElement;
+  const a = document.activeElement, docOf = (el) => `[data-doc="${CSS.escape(el.closest("[data-doc]")?.dataset.doc ?? "")}"] `;
   const refocus = a?.dataset?.draft != null ? `[data-draft="${CSS.escape(a.dataset.draft)}"]`
+    : a?.dataset?.guess != null ? docOf(a) + `[data-guess="${CSS.escape(a.dataset.guess)}"]`
+    : a?.dataset?.step != null ? docOf(a) + `[data-step^="${CSS.escape(a.dataset.step.split(":")[0])}:"].${a.classList.contains("next") ? "next" : "back"}`
     : a?.dataset?.node != null ? `[data-dg="${a.dataset.dg}"][data-node="${CSS.escape(a.dataset.node)}"]` : null;
-  const caret = a?.dataset?.draft != null ? [a.selectionStart, a.selectionEnd] : null;
+  const caret = a?.dataset?.draft != null || a?.dataset?.guess != null ? [a.selectionStart, a.selectionEnd] : null;
   paint($("study"), html);
   for (const box of $("study").querySelectorAll("textarea[data-draft]")) {
     const id = box.dataset.draft;
     box.value = drafts.get(id) ?? practice.find((q) => q.id === id)?.user_data?.attempt ?? "";
     syncCheck(box);
+  }
+  for (const box of $("study").querySelectorAll("input[data-guess]")) { // a guess being typed survives the redraw
+    box.value = drafts.get(guessKey(box)) ?? noteById.get(box.closest("[data-doc]")?.dataset.doc)?.user_data?.guesses?.[box.dataset.guess] ?? "";
   }
   const again = refocus && $("study").querySelector(refocus);
   again?.focus({ preventScroll: true });
@@ -985,8 +1224,15 @@ function homeScreen(today) {
   if (!modules.length) return html + empty(ICON.books, "No modules yet", "Modules, lecture notes and flashcards arrive after the next lecture sync on the Mac.");
   return html + `<h2 class="section">Modules</h2><ul class="group flat">${modules.map((m) => {
     const name = moduleName(m), lecs = lectures.filter((l) => l.module === name).length, d = dueFor(name).length;
-    return row({ tag: "button", attrs: `data-module="${esc(name)}"`, title: esc(name), sub: esc([plural(lecs, "lecture"), d && `${d} due`].filter(Boolean).join(" · ")), chev: true });
+    return row({ tag: "button", attrs: `data-module="${esc(name)}"`, title: esc(name), sub: esc([plural(lecs, "lecture"), d && `${d} due`, prepLine(name)].filter(Boolean).join(" · ")), chev: true });
   }).join("")}</ul>`;
+}
+
+/** "Prep 2 of 6": the tick list of the module's next brief, "" when it has none. */
+function prepLine(name) {
+  const b = nextBrief([...noteById.values()].filter((x) => x.module === name));
+  const items = (Array.isArray(b?.data?.doc?.blocks) ? b.data.doc.blocks : []).filter((x) => x?.t === "checklist").flatMap((x) => (Array.isArray(x.items) ? x.items : []));
+  return items.length ? `Prep ${items.filter((x) => b.user_data?.checks?.[x.id] === true).length} of ${items.length}` : "";
 }
 
 function moduleScreen(name, today) {
@@ -1031,18 +1277,20 @@ function assessmentRows(text) {
 
 /** The note's structured doc when it has one, else its Markdown body; "" when it has neither. */
 function noteHtml(note, sections) {
-  if (!folds.has(note.id)) folds.set(note.id, { open: new Set(), shown: new Set() });
   const body = typeof note.data?.body === "string" ? note.data.body : "";
-  const html = lectureDoc(note.data?.doc, folds.get(note.id), sections) ?? (body.trim() ? markdown(body, sections) : "");
-  return html ? `<div class="prose" data-doc="${esc(note.id)}">${html}</div>` : "";
+  const state = { ...foldsFor(note.id), user: note.user_data ?? {} };
+  const html = lectureDoc(note.data?.doc, state, sections) ?? (body.trim() ? markdown(body, sections) : "");
+  return html ? playerHtml(note) + `<div class="prose" data-doc="${esc(note.id)}">${html}</div>` : "";
 }
+/** The reader's state for a note: revealed answers, tapped-open boxes, each steps block's frame, and re-ask mode. */
+const foldsFor = (id) => { if (!folds.has(id)) folds.set(id, { open: new Set(), shown: new Set(), frames: new Map(), reask: false }); return folds.get(id); };
 
 /** The Google Doc, when there is one. The note's sections go to the bar's Contents button (`contentsFor`). */
 let screenSections = [];
-function toolbar(sections, url) {
+function toolbar(sections, url, more = "") {
   screenSections = sections;
   const docs = typeof url === "string" && url.startsWith("https://");
-  return docs ? `<div class="toolbar"><a class="btn secondary small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Google Docs</a></div>` : "";
+  return docs || more ? `<div class="toolbar">${docs ? `<a class="btn secondary small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Google Docs</a>` : ""}${more}</div>` : "";
 }
 function setContents(open) {
   const menu = $("contents-menu");
@@ -1065,7 +1313,7 @@ function lectureScreen(id, today) {
   return `${head(lec.data?.topic ?? lec.title ?? "Lecture", [short(lec.module), n, day && shortDay(day.slice(0, 10))].filter(Boolean).join(" · "))}
     ${pre && post ? `<div class="seg" role="tablist" aria-label="Which note" style="--n: 2; --i: ${usePrimer ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["Primer", true], ["Notes", false]]
       .map(([label, v]) => `<button type="button" role="tab" data-primer="${v}" aria-selected="${usePrimer === v}">${label}</button>`).join("")}</div>` : ""}
-    ${toolbar(sections, url)}
+    ${toolbar(sections, url, `<button class="btn secondary small" type="button" data-act="note-class" data-m="${esc(lec.module)}" data-l="${esc(n)}">Note for this class</button>`)}
     ${note?.data?.kind === "post" && note.data.from === "slides" ? `<p class="note-line">Built from the slides. Sidebrain rebuilds these notes when the recording’s transcript arrives.</p>` : ""}
     ${body || (over ? empty(ICON.doc, "No notes yet", "Build the notes from the recording in Sidebrain on the Mac.")
                     : empty(ICON.doc, "Notes come after the lecture", "They arrive here once it has finished."))}
@@ -1109,6 +1357,8 @@ function practiceCard(q, withModule = false) {
   </article>`;
 }
 
+const guessKey = (el) => `${el.closest("[data-doc]")?.dataset.doc}:${el.dataset.guess}`;
+
 /** The answer button: needs something written, and once the model answer shows, something new to save. */
 function syncCheck(box) {
   const id = box.dataset.draft, text = box.value.trim(), saved = practice.find((q) => q.id === id)?.user_data?.attempt ?? "";
@@ -1137,10 +1387,28 @@ function renderSheet() {
 
 function bind() {
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-act],[data-grade],[data-tab],[data-tick],[data-task],[data-move],[data-letgo],[data-cw],[data-module],[data-lecture],[data-note],[data-practice],[data-primer],[data-check],[data-skip],[data-jump],[data-dg],[data-dg-all],[data-close],[data-mode],[data-remove-photo]");
+    const t = e.target.closest("[data-act],[data-grade],[data-tab],[data-tick],[data-task],[data-move],[data-letgo],[data-cw],[data-module],[data-lecture],[data-note],[data-practice],[data-primer],[data-check],[data-skip],[data-jump],[data-dg],[data-dg-all],[data-close],[data-mode],[data-remove-photo],"
+      + "[data-open],[data-ping],[data-pmore],[data-snooze],[data-pdone],[data-cl],[data-step],[data-qz],[data-play],[data-ver],[data-speed]");
     if (!t) return;
     const d = t.dataset;
     if (d.close != null) return t.closest("dialog").close();
+    if (d.open) return openTarget(d.open) || tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
+    if (d.ping) return openPing(d.ping);
+    if (d.pmore) return openPingSheet(d.pmore);
+    if (d.snooze) { pingWrite(sheetPing, { snoozedUntil: d.snooze, seenAt: null }); $("ping-sheet").close(); return render(); }
+    if (d.pdone != null) { const done = pings.find((x) => x.id === sheetPing)?.user_data?.done === true;
+      pingWrite(sheetPing, done ? { done: false, doneAt: null } : { done: true, doneAt: Date.now() }); $("ping-sheet").close(); return render(); }
+    if (d.play) return togglePlay(d.play);
+    if (d.ver) { if (player.version !== d.ver || player.id !== t.closest("[data-player]").dataset.player) { stopAudio(); player.id = t.closest("[data-player]").dataset.player; player.version = d.ver; } return render(); }
+    if (d.speed != null) { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; keep("speed", speed); audio.playbackRate = speed; return render(); }
+    const doc = noteById.get(t.closest("[data-doc]")?.dataset.doc);
+    if (doc && d.cl) { const checks = { ...(doc.user_data?.checks ?? {}) }; checks[d.cl] = checks[d.cl] !== true; writeUser(doc, { checks }, "edit"); return render(); }
+    if (doc && d.qz) { const [k, j] = d.qz.split(":").map(Number); writeUser(doc, { quiz: { ...(doc.user_data?.quiz ?? {}), [k]: j } }, "edit"); return render(); }
+    if (doc && d.step) { // one frame on, or back; a gentle cross-fade, none under Reduce Motion
+      const [block, k] = d.step.split(":");
+      foldsFor(doc.id).frames.set(block, Number(k));
+      return document.startViewTransition && !still() ? document.startViewTransition(render) : render();
+    }
     if (d.grade) return grade(Number(d.grade));
     if (d.tick) return tick(d.tick);
     if (d.task) return openTaskSheet(d.task);
@@ -1154,8 +1422,11 @@ function bind() {
       case "slipped": openSlipped = !openSlipped; return render();
       case "all-due": allDue = !allDue; return render();
       case "all-events": allEvents = !allEvents; return render();
+      case "all-next": allNext = !allNext; return render();
       case "earlier": openEarlier = !openEarlier; return render();
       case "add": return openAdd("todo");
+      case "note-class": captureFor = { module: d.m, lecture: d.l || null }; openAdd("note");
+        return say($("add-sheet").querySelector("[data-compose=add] [role=status]"), `For ${[short(d.m), d.l].filter(Boolean).join(" ")}`);
       case "flip": return flip();
       case "review": return openReview(d.m || null, d.l || null);
       case "close-review": return closeReview();
@@ -1189,6 +1460,7 @@ function bind() {
   }, true);
   document.addEventListener("input", (e) => {
     if (e.target.matches?.("form.compose textarea")) return canSave(e.target.closest("form"));
+    if (e.target.dataset?.guess != null) return drafts.set(guessKey(e.target), e.target.value);
     if (e.target.dataset?.draft == null) return;
     drafts.set(e.target.dataset.draft, e.target.value);
     syncCheck(e.target);
@@ -1196,6 +1468,12 @@ function bind() {
   document.addEventListener("change", (e) => {
     const el = e.target;
     if (el.matches("[data-pick]")) return el.value && move(sheetTask, el.value);
+    if (el.dataset.guess != null) { // a guess is saved when the field is left (or the app goes to the background)
+      const doc = noteById.get(el.closest("[data-doc]")?.dataset.doc);
+      if (doc && (doc.user_data?.guesses?.[el.dataset.guess] ?? "") !== el.value.trim()) writeUser(doc, { guesses: { ...(doc.user_data?.guesses ?? {}), [el.dataset.guess]: el.value.trim() } }, "edit");
+      drafts.delete(guessKey(el));
+      return;
+    }
     if (el.id === "remind") return toggleReminders();
     if (el.name === "photo") return el.files?.[0] && setPhoto(el.closest("form"), el.files[0]);
   });
@@ -1232,11 +1510,17 @@ function bind() {
     updateTodo();
   });
   $("todo-form").onsubmit = saveTodo;
-  $("add-sheet").addEventListener("close", () => { if (!$("todo").value.trim()) resetTodo(); });
+  $("add-sheet").addEventListener("close", () => { captureFor = null; if (!$("todo").value.trim()) resetTodo(); });
   $("redirect-signin").onclick = redirectSignIn;
   addEventListener("online", () => { cloud = ""; sb ? refresh() : connect(); });
+  if (navigator.serviceWorker) navigator.serviceWorker.onmessage = (e) => {
+    if (typeof e.data?.open !== "string") return;
+    takeLink(e.data.open);
+    routePending(DEMO);
+    if (pending || pendingPing) refresh(); // not here yet: fetch, then try again
+  };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible") return document.activeElement?.matches?.("[data-guess]") && document.activeElement.blur();
     if (session.day !== todayString() && !current()) newSession();
     DEMO ? render() : refresh();
   });
@@ -1280,6 +1564,8 @@ function demoData() {
   const task = (id, date, title, origin, user_data = {}, more = {}, created = 1) => ({ id, source: "demo", title, date, data: { title, origin, ...more }, user_data, created_at: daysAgo(created) });
   const clockAt = (hhmm) => new Date(`${t}T${hhmm}:00`).toISOString().replace(/\.\d{3}Z$/, "Z"); // today, local time, as VoiceType writes it
   const h = new Date().getHours();
+  const msStart = new Date(`${day(1)}T11:00`), msClass = { id: "ev-ms-sem1", title: "Marketing and Society seminar", date: day(1),
+    data: { title: "Marketing and Society seminar", start: msStart.toISOString(), end: new Date(msStart.getTime() + 36e5).toISOString(), location: "JC Computer Science A01" }, user_data: {} };
   const event = (id, dh, mins, title, location, m = 0) => {
     const start = new Date(); start.setHours(h + dh, m, 0, 0);
     return start.getDate() === new Date().getDate() && start.getHours() >= 6
@@ -1298,7 +1584,9 @@ function demoData() {
       event("ev-group", 4, 90, "SM group meeting", "Hallward Library, room 3"),
       event("ev-spin", 6, 45, "Spin class", "Jubilee Sports Centre"),
       { id: "ev-fair", title: "Careers fair week", date: day(-2), data: { title: "Careers fair week", allDay: true, start: `${day(-2)}T00:00:00+01:00`, end: `${day(3)}T00:00:00+01:00` }, user_data: {} }, // began before today, still on
+      msClass, // tomorrow 11:00, the brief's class
     ].filter(Boolean),
+    pings: demoPings(),
     assessments: [
       assess("assess-crg-essay", crg, day(5), { title: "Essay", weight: "50%", milestones: [{ date: day(1), label: "Outline to tutor" }, { date: day(12), label: "Full draft" }] }),
       assess("assess-sm-group", sm, day(24), { title: "Group presentation", weight: "30%", milestones: [{ date: day(6), label: "Slides to the group" }] }),
@@ -1334,6 +1622,62 @@ function demoData() {
       { id: "you-demo-n4", source: "you", title: "Room change", data: { body: "SM seminar moves to B32 from next week" }, user_data: {}, created_at: daysAgo(3.1) },
     ],
   };
+}
+
+/** The contract's test brief (docs/(C) Brief + ping contract.md §8): M&S Seminar 1, tomorrow 11:00 in JC CS A01, with
+ *  every brief block and audio scripts but no recording, so the player falls back to the phone's voice. */
+function demoBrief(day) {
+  const classAt = new Date(`${day(1)}T11:00`).toISOString();
+  const doc = { version: 1, blocks: [
+    { t: "h1", text: "M&S Seminar 1 · The essay brief" },
+    { t: "meta", text: "Marketing & Society (BUSI3023) · Seminar 1 · JC Computer Science A01" },
+    { t: "p", text: "The seminar walks through the **assessment brief**, the **rubric** and the **AI rules**. Prep is compulsory: you may be asked to leave without it." },
+    { t: "checklist", items: [
+      { id: "c1", text: "Read the assessment brief", detail: "8 pages. Note the four sections and the AI table.", minutes: 20, must: true },
+      { id: "c2", text: "Read the marking rubric", detail: "10 criteria; watch “Written communication”.", minutes: 20, must: true },
+      { id: "c3", text: "Pick one context", detail: "Advertising, energy and poverty, or healthy sustainable food.", minutes: 5, must: true },
+      { id: "c4", text: "Find an example you have met yourself", minutes: 25, must: true },
+      { id: "c5", text: "Background reading on the scale of the problem", minutes: 50, must: true },
+      { id: "c6", text: "Write down your questions", minutes: 10 } ] },
+    { t: "steps", title: "How the essay is built", diagram: { type: "graph", nodes: [
+        { id: "s1", title: "1 · The problem", sub: "300 words", row: 0 }, { id: "s2", title: "2 · Critical analysis", sub: "700 words", row: 0 },
+        { id: "s3", title: "3 · Reflection", sub: "500 words", row: 1 }, { id: "s4", title: "4 · Recommendations", sub: "500 words", row: 1 }], edges: [] },
+      frames: [
+        { text: "**Section 1** names a problem you have met yourself, with your own evidence and its scale in the UK.", focus: ["s1"] },
+        { text: "**Section 2** brings in theory. It carries the most marks: 30% for 700 words.", focus: ["s2"] },
+        { text: "**Section 3** reflects as a consumer *and* a citizen, and links back to section 2.", focus: ["s3"] },
+        { text: "**Section 4** recommends, for a named stakeholder, with the obstacles.", focus: ["s4"] } ] },
+    { t: "marks", title: "Where the marks are", rows: [
+      { label: "1 · The problem", words: 300, weight: 15, ai: "ban" }, { label: "2 · Critical analysis", words: 700, weight: 30, ai: "opt" },
+      { label: "3 · Reflection", words: 500, weight: 25, ai: "ban" }, { label: "4 · Recommendations", words: 500, weight: 25, ai: "ban" },
+      { label: "Written communication", words: 0, weight: 5, ai: "gram" } ] },
+    { t: "prequestions", items: [
+      { q: "Which three contexts may the essay use?", answer: "Advertising; energy use and poverty; healthy, sustainable food." },
+      { q: "Which section carries the most marks?", answer: "Section 2, critical analysis: 30%." },
+      { q: "Where is AI banned outright?", answer: "Problem identification, personal reflection and recommendations." } ] },
+    { t: "quiz", items: [
+      { q: "How long is the essay?", options: ["1,500 words", "2,000 words", "3,000 words"], answer: 1, why: "Four sections: 300, 700, 500 and 500." },
+      { q: "Can AI check your grammar?", options: ["Never", "Yes, once your own content is complete"], answer: 1, why: "Grammar and structure checks are optional, after you've written it." } ] },
+  ] };
+  return { id: "auto-pre-ms-sem1", module: "Marketing & Society", date: day(1), title: "M&S Seminar 1 brief", user_data: {},
+    data: { kind: "pre", lecture: "Seminar 1", classAt, where: "JC Computer Science A01", minutes: 130, doc,
+      audio: { short: { script: "Tomorrow's Marketing and Society seminar goes through the essay brief, the rubric and the AI rules. Read the brief and the rubric, pick one of the three contexts, and find an example you have met yourself." },
+               full: { script: "Here is the full brief for Marketing and Society, Seminar 1. The seminar walks through the assessment brief, the marking rubric and the rules on AI. The essay has four sections: the problem, critical analysis, reflection and recommendations." } } } };
+}
+
+/** Pings around the demo brief: some have fired (the Inbox), some are still to come (Up next). */
+function demoPings() {
+  const t = todayString(), at = (days, hhmm) => new Date(`${addDays(t, days)}T${hhmm}`), iso = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  const ping = (id, title, when, kind, open, user_data = {}) => ({ id, title, date: localDay(when.getTime()), data: { at: iso(when), kind, open }, user_data });
+  const ago = (mins) => new Date(Date.now() - mins * 6e4);
+  return [
+    ping("ping-moodle-ms-brief", "M&S: assessment brief posted", ago(95), "moodle", "url:https://moodle.nottingham.ac.uk/"),
+    ping("ping-notes-crg-l1", "CRG L1 notes ready", ago(26 * 60), "notes", "note:auto-post-crg-l1", { seenAt: Date.now() - 25 * 36e5 }),
+    ping("ping-deadline-crg-outline", "CRG essay outline due tomorrow", ago(4 * 60), "deadline", "item:assess-crg-essay"),
+    ping("ping-brief-ms-sem1", "M&S Seminar 1 brief", at(0, "20:00"), "brief", "note:auto-pre-ms-sem1"),
+    ping("ping-nudge-ms-sem1", "M&S Seminar 1 in an hour", at(1, "10:00"), "nudge", "listen:auto-pre-ms-sem1"),
+    ping("ping-reask-ms-sem1", "M&S Seminar 1: three questions", at(2, "09:00"), "reask", "reask:auto-pre-ms-sem1"),
+  ];
 }
 
 /** Study's sample: two modules, three lectures, a structured doc (every block type, a blank diagram, folded answers),
@@ -1382,15 +1726,18 @@ function demoStudy(t, day) {
   ] };
   return {
     modules: [
+      { id: "mod-ms", module: "Marketing & Society", title: "Marketing & Society", data: { code: "BUSI3023", short: "M&S", convenor: "Dr Samanthika Gallage", assessment: "Essay 100% due 8 Dec" } },
       { id: "mod-crg", module: crg, title: crg, data: { code: "BUSI3028", short: "CRG", convenor: "Dr Sarah Lane", assessment: "Exam, 2 hours, 100%, 2 essays from 6, January", next: "L2 Wed 10:00 · Jensen & Meckling model · exam 100%" } },
       { id: "mod-sm", module: sm, title: sm, data: { code: "BUSI3186", short: "SM", convenor: "Dr Tom Hale", assessment: "Group video 30% due 10 Dec · case study 70% due 13 May", next: "L2 Fri 09:00 · External analysis" } },
     ],
     lectures: [
+      { id: "lec-marketing-society-sem1", module: "Marketing & Society", date: day(1), title: null, data: { n: "Seminar 1", topic: "The essay brief, the rubric and AI rules", pre: "auto-pre-ms-sem1" }, user_data: {} },
       { id: "lec-crg-l1", module: crg, date: day(-6), title: null, data: { n: "L1", topic: "Why corporate governance exists", pre: "auto-pre-crg-l1", post: "auto-post-crg-l1" }, user_data: {} },
       { id: "lec-crg-l2", module: crg, date: day(1), title: null, data: { n: "L2", topic: "The Jensen & Meckling model", pre: "auto-pre-crg-l2" }, user_data: {} },
       { id: "lec-sm-l1", module: sm, date: day(-4), title: null, data: { n: "L1", topic: "What is strategy?", post: "auto-post-sm-l1" }, user_data: {} },
     ],
     lectureNotes: [
+      demoBrief(day),
       note("auto-pre-crg-l1", crg, "pre", "L1", "CRG L1 primer", { body: "Before L1: skim **Berle & Means (1932)**, the abstract only.\n\n- Who owns a listed firm?\n- Who runs it, and why might they differ?" }),
       note("auto-post-crg-l1", crg, "post", "L1", "CRG L1 · Why corporate governance exists", { body: "## One-page core\nDispersed owners don’t monitor.", doc }),
       note("auto-pre-crg-l2", crg, "pre", "L2", "CRG L2 primer", { body: "## Before L2\nThe *Jensen & Meckling (1976)* model is “as hard as it gets”: one graph, no heavy maths.\n\n1. Draw firm value against the manager’s share.\n2. Mark where perks start to cost the owners.\n\n> Read the introduction and conclusion; skip the proofs." }),

@@ -3,8 +3,11 @@
 // structured lecture doc in `data.doc` (docs/(C) Lecture doc format.md; Sources/(C) LectureDoc.swift and
 // Sources/(C) View LectureDoc.swift). All text is HTML-escaped first; only http(s) and mailto links become links.
 // Pure functions, no DOM: checked by node --test web/notes.test.mjs.
+import { prep } from "./today.js";
 
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+/** The round tick (tasks, checklists). */
+export const TICK = `<svg viewBox="0 0 22 22" aria-hidden="true"><circle class="ring" cx="11" cy="11" r="10.25"/><circle class="disc" cx="11" cy="11" r="11"/><path class="check" d="M6.6 11.4l3 3 5.8-6.3" pathLength="1"/></svg>`;
 const str = (x) => (typeof x === "string" ? x : "");
 const arr = (x) => (Array.isArray(x) ? x : []);
 const WIKI = [[/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2"], [/\[\[([^\]]+)\]\]/g, "$1"]];
@@ -125,14 +128,17 @@ export function isAnswers(callout) {
 
 /** A note's `data.doc` as HTML, blocks in order, h1 skipped (the screen carries the title). Null unless it is a
  *  version-1 doc with a readable block (LectureDoc(json:)); unknown block types are skipped. `state` is the reader's:
- *  `open` holds the block indexes of revealed answers, `shown` the "block:node" ids tapped open on a blank diagram. */
+ *  `open` holds the block indexes of revealed answers, `shown` the "block:node" ids tapped open on a blank diagram,
+ *  `frames` each steps block's frame (block index → frame), `user` the note's user_data (checks, quiz, guesses),
+ *  and `reask` true when opened as a re-ask. */
 export function lectureDoc(json, state = {}, sections = []) {
   if (!json || typeof json !== "object" || Array.isArray(json) || (json.version ?? 1) !== 1 || !Array.isArray(json.blocks)) return null;
-  const parts = json.blocks.map((b, i) => (b && typeof b === "object" ? block(b, i, state, sections) : null));
+  const n = { quiz: 0, pre: 0 }; // quiz and guess keys count across the whole doc, as on the Mac (LectureDoc.itemStarts)
+  const parts = json.blocks.map((b, i) => (b && typeof b === "object" ? block(b, i, state, sections, n) : null));
   return parts.some((p) => p != null) ? parts.join("") : null;
 }
 
-function block(b, i, state, sections) {
+function block(b, i, state, sections, n) {
   const text = str(b.text), items = arr(b.items).filter((x) => typeof x === "string");
   const list = (tag) => `<${tag}>${items.map((x) => `<li>${inline(x)}</li>`).join("")}</${tag}>`;
   switch (b.t) {
@@ -160,8 +166,97 @@ function block(b, i, state, sections) {
     }
     case "table": return table(arr(b.header).map((x) => String(x ?? "")), arr(b.rows).filter(Array.isArray).map((r) => r.map((x) => String(x ?? ""))));
     case "diagram": return diagram(b.diagram, str(b.caption), i, state);
+    case "checklist": return checklist(b, state.user ?? {});
+    case "steps": return steps(b, i, state);
+    case "quiz": return quiz(b, state.user ?? {}, n);
+    case "marks": return marks(b);
+    case "prequestions": return prequestions(b, i, state, n);
     default: return null;
   }
+}
+
+// ---------- Brief blocks (docs/(C) Brief + ping contract.md §2) ----------
+
+const objects = (x) => arr(x).filter((o) => o && typeof o === "object");
+
+/** A tick list with minutes; ticks are user_data.checks {id: true}. The top line counts the must-dos and the minutes left. */
+function checklist(b, user) {
+  const items = objects(b.items).filter((x) => typeof x.id === "string" && typeof x.text === "string");
+  if (!items.length) return null;
+  const checks = user.checks && typeof user.checks === "object" ? user.checks : {}, done = (x) => checks[x.id] === true;
+  const must = items.filter((x) => x.must === true), left = items.filter((x) => !done(x)).reduce((s, x) => s + (Number(x.minutes) || 0), 0);
+  const line = [must.length && `${must.filter(done).length} of ${must.length} must-dos done`, left ? `${prep(left)} left` : items.every(done) ? "All done" : ""].filter(Boolean).join(" · ");
+  return `<div class="card checklist">${line ? `<p class="caption">${esc(line)}</p>` : ""}<ul>${items.map((x) => {
+    const meta = [Number(x.minutes) > 0 && prep(Number(x.minutes)), x.must === true && "Must do"].filter(Boolean).join(" · ");
+    return `<li class="cl${done(x) ? " done" : ""}"><button class="tick" type="button" data-cl="${esc(x.id)}" aria-pressed="${done(x)}" aria-label="${done(x) ? "Undo" : "Done"}: ${esc(plain(x.text))}">${TICK}</button>
+      <span class="cl-text"><span>${inline(x.text)}</span>${str(x.detail) ? `<span class="foot">${inline(x.detail)}</span>` : ""}${meta ? `<span class="foot">${meta}</span>` : ""}</span></li>`;
+  }).join("")}</ul></div>`;
+}
+
+/** A step-through: one frame at a time with Back and Next. A frame's `focus` nodes are highlighted and the rest dimmed;
+ *  a frame's own diagram replaces the shared one. The app swaps frames in a view transition (none under Reduce Motion). */
+function steps(b, i, state) {
+  const frames = objects(b.frames);
+  if (!frames.length) return null;
+  const n = frames.length, k = Math.min(Math.max(0, Number(state.frames?.get(String(i))) || 0), n - 1), f = frames[k];
+  const nav = `<p class="step-text">${inline(str(f.text))}</p><div class="step-nav">
+    <button class="btn secondary small back" type="button" data-step="${i}:${k - 1}"${k === 0 ? " disabled" : ""}>Back</button>
+    <span class="foot">Step ${k + 1} of ${n}</span>
+    <button class="btn primary small next" type="button" data-step="${i}:${k + 1}"${k === n - 1 ? " disabled" : ""}>Next</button></div>`;
+  const d = f.diagram && typeof f.diagram === "object" ? f.diagram : b.diagram;
+  const title = str(b.title) || str(d?.title);
+  return diagram(d && { ...d, title }, "", i, state, { focus: arr(f.focus), html: nav })
+    ?? `<div class="card steps">${title ? `<p class="strong">${inline(title)}</p>` : ""}${nav}</div>`;
+}
+
+/** Tap an answer, then right or wrong plus why; choices are user_data.quiz {index: chosen}, index counted doc-wide. */
+function quiz(b, user, n) {
+  const qs = objects(b.items).filter((x) => typeof x.q === "string" && Array.isArray(x.options));
+  if (!qs.length) return null;
+  const at = n.quiz; n.quiz += qs.length;
+  const all = user.quiz && typeof user.quiz === "object" ? user.quiz : {}, chosen = qs.map((_, k) => all[at + k]), picked = (k) => Number.isInteger(chosen[k]);
+  const answered = qs.filter((_, k) => picked(k)).length, right = qs.filter((x, k) => picked(k) && chosen[k] === x.answer).length;
+  const score = answered ? `${right} of ${answered} right${answered < qs.length ? ` · ${qs.length - answered} to go` : ""}` : `${qs.length} question${qs.length === 1 ? "" : "s"}`;
+  return `<div class="card quiz"><p class="caption" aria-live="polite">${score}</p>${qs.map((x, k) => {
+    const has = picked(k), ok = has && chosen[k] === x.answer;
+    return `<div class="qz"><p class="strong">${inline(x.q)}</p><div class="opts">${x.options.map((o, j) => {
+      const cls = has && j === x.answer ? " right" : has && j === chosen[k] ? " wrong" : "";
+      return `<button class="opt${cls}" type="button" data-qz="${at + k}:${j}" aria-pressed="${has && j === chosen[k]}"${has ? " disabled" : ""}>${inline(String(o ?? ""))}</button>`;
+    }).join("")}</div>${has ? `<p class="why"><span class="${ok ? "ok" : "no"}">${ok ? "Right." : "Not quite."}</span> ${inline(str(x.why))}</p>` : ""}</div>`;
+  }).join("")}</div>`;
+}
+
+const AI = { ban: "AI not allowed", opt: "AI optional", gram: "Grammar checks only" };
+/** Where the words and the marks go: two stacked bars coloured by the AI rule, a legend, and each part in words. */
+function marks(b) {
+  const rows = objects(b.rows).filter((r) => typeof r.label === "string");
+  if (!rows.length) return null;
+  const ai = (r) => (AI[r.ai] ? r.ai : "gram"), num = (x) => Math.max(0, Number(x) || 0);
+  const total = (key) => rows.reduce((s, r) => s + num(r[key]), 0);
+  const bar = (key, label) => total(key) ? `<div class="mk-bar"><span class="foot">${label}</span><div class="mk-track">${rows.map((r) =>
+    num(r[key]) ? `<i class="ai-${ai(r)}" style="flex-grow:${num(r[key])}"></i>` : "").join("")}</div></div>` : "";
+  const used = Object.keys(AI).filter((k) => rows.some((r) => ai(r) === k));
+  return `<figure class="card marks">${str(b.title) ? `<p class="strong">${inline(b.title)}</p>` : ""}
+    <div aria-hidden="true">${bar("words", "Words")}${bar("weight", "Marks")}</div>
+    <ul class="mk-rows">${rows.map((r) => `<li><i class="sw ai-${ai(r)}" aria-hidden="true"></i><span>${inline(r.label)}</span>
+      <span class="foot">${[num(r.words) && `${num(r.words).toLocaleString("en-GB")} words`, num(r.weight) && `${num(r.weight)}%`].filter(Boolean).join(" · ")}<span class="sr">, ${AI[ai(r)]}</span></span></li>`).join("")}</ul>
+    <p class="mk-legend foot" aria-hidden="true">${used.map((k) => `<span><i class="sw ai-${k}"></i>${AI[k]}</span>`).join("")}</p></figure>`;
+}
+
+/** Questions to guess before class: a guess field each (user_data.guesses {i: text}, i doc-wide; the app fills the values,
+ *  so typing survives a redraw) and no answers. Opened as a re-ask, each guess beside its answer; the answers show nowhere else. */
+function prequestions(b, i, state, n) {
+  const qs = objects(b.items).filter((x) => typeof x.q === "string");
+  if (!qs.length) return null;
+  const at = n.pre; n.pre += qs.length;
+  const guesses = state.user?.guesses && typeof state.user.guesses === "object" ? state.user.guesses : {};
+  const guess = (k) => (typeof guesses[at + k] === "string" ? guesses[at + k].trim() : "");
+  if (state.reask) {
+    return `<div class="card preq" id="preq-${i}"><p class="strong">Your guesses and the answers</p><ol>${qs.map((x, k) => `<li><p>${inline(x.q)}</p>
+      <p class="foot">${guess(k) ? `You guessed: ${esc(guess(k))}` : "No guess"}</p><p class="answer">${inline(str(x.answer))}</p></li>`).join("")}</ol></div>`;
+  }
+  return `<div class="card preq" id="preq-${i}"><p class="strong">Guess first</p><p class="caption">A guess for each, even a wild one. The class answers them.</p><ol>${qs.map((x, k) =>
+    `<li><label><span>${inline(x.q)}</span><input class="guess" type="text" data-guess="${at + k}" placeholder="Your guess" enterkeyhint="done" autocomplete="off"></label></li>`).join("")}</ol></div>`;
 }
 
 const TONES = ["key", "con", "plain", "verdict"];
@@ -171,7 +266,7 @@ const tone = (t) => (TONES.includes(t) ? t : "plain");
  *  dashed = opposing ⇢), or a timeline down the left edge. Blank "complete me" diagrams hide every box not in `keep`
  *  (and its name in the arrows) until it is tapped.
  *  ponytail: no drawn arrows; the Mac's routed graph layout is 400 lines. Port it if the written-out arrows read badly. */
-function diagram(d, caption, i, state) {
+function diagram(d, caption, i, state, step = null) {
   if (!d || typeof d !== "object" || (d.type !== "graph" && d.type !== "timeline")) return null;
   const raw = arr(d.nodes).filter((n) => n && typeof n === "object");
   // Rows: explicit `row`, else the old x/y layouts clustered (same y within 40 = same row, then by x).
@@ -189,16 +284,18 @@ function diagram(d, caption, i, state) {
   const keep = arr(d.keep), blank = d.blank === true && d.type === "graph";
   const blankable = (n) => blank && !keep.includes(n.id);
   const hidden = (n) => blankable(n) && !state.shown?.has(`${i}:${n.id}`);
+  // A step's focus: its nodes highlighted, the rest dimmed.
+  const lit = (id) => (!step?.focus.length ? "" : step.focus.includes(id) ? " focus" : " dim");
   let body;
   if (d.type === "timeline") {
-    body = `<ol class="dg-time">${events.map((e) => `<li class="tone-${tone(e.tone)}"><b>${esc(e.label)}</b><i aria-hidden="true"></i><span>${esc(e.text)}</span></li>`).join("")}</ol>`;
+    body = `<ol class="dg-time">${events.map((e) => `<li class="tone-${tone(e.tone)}${lit(e.id ?? e.label)}"><b>${esc(e.label)}</b><i aria-hidden="true"></i><span>${esc(e.text)}</span></li>`).join("")}</ol>`;
   } else {
     const rows = [...new Set(nodes.map((n) => n.row))].map((r) => nodes.filter((n) => n.row === r));
     // An argument map (any key, con or verdict box) reads by its captions: Claim, For, Against, Verdict. A plain flow keeps its arrows.
     const argument = nodes.some((n) => n.tone !== "plain");
     const role = (n) => (n.tone === "key" ? "For" : n.tone === "con" ? "Against" : n.tone === "verdict" ? "Verdict" : n.row === nodes[0].row ? "Claim" : "");
     const inner = (n) => `<b>${esc(n.title)}</b>${n.sub ? `<small>${esc(n.sub)}</small>` : ""}`;
-    const box = (n) => !blankable(n) ? `<div class="dg-node tone-${n.tone}">${inner(n)}</div>`
+    const box = (n) => !blankable(n) ? `<div class="dg-node tone-${n.tone}${lit(n.id)}">${inner(n)}</div>`
       : `<button type="button" class="dg-node tone-${hidden(n) ? "blank" : n.tone}" data-dg="${i}" data-node="${esc(n.id)}" aria-pressed="${!hidden(n)}"${hidden(n) ? ` aria-label="Blank box"` : ""}>${hidden(n) ? "" : inner(n)}</button>`;
     const name = (n) => (hidden(n) ? `<span class="blank-name" aria-label="blank">?</span>` : esc(n.title));
     const groups = argument ? rows.flatMap((row) => [...new Set(row.map(role))].map((r) => [r, row.filter((n) => role(n) === r)])) : rows.map((row) => ["", row]);
@@ -206,10 +303,10 @@ function diagram(d, caption, i, state) {
       ${edges.length && !argument ? `<ul class="dg-edges">${edges.map((e) => `<li${e.style === "dashed" ? ` class="against"` : ""}>${name(byId.get(e.from))} <i>${esc(e.verb)}</i> ${e.style === "dashed" ? "⇢" : "→"} ${name(byId.get(e.to))}</li>`).join("")}</ul>` : ""}`;
   }
   const blanks = nodes.filter(blankable), all = blanks.every((n) => !hidden(n));
-  return `<figure class="card diagram">
+  return `<figure class="card diagram${step ? " steps" : ""}">
     ${str(d.title) ? `<p class="strong">${esc(d.title)}</p>` : ""}${str(d.note) && d.type !== "graph" ? `<p class="caption">${inline(d.note)}</p>` : ""}
     ${blank && caption ? `<figcaption class="above">${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}${body}${caption && !blank ? `<figcaption>${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}
-    ${blanks.length ? `<div class="dg-foot"><button type="button" class="link" data-dg-all="${i}">${all ? "Hide all" : "Show all"}</button></div>` : ""}
+    ${blanks.length ? `<div class="dg-foot"><button type="button" class="link" data-dg-all="${i}">${all ? "Hide all" : "Show all"}</button></div>` : ""}${step?.html ?? ""}
   </figure>`;
 }
 

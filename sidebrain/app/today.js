@@ -219,6 +219,83 @@ export function daySchedule(events, now = new Date(), limit = 3, all = false) {
            next: all ? next : next.slice(0, limit), more: next.length > limit };
 }
 
+// ---------- Pings, Up next and the Inbox (docs/(C) Brief + ping contract.md §1, §6) ----------
+
+/** A ping's fire time: user_data.snoozedUntil, else data.at; null when neither is a time. */
+export const fireAt = (p) => instant(p.user_data?.snoozedUntil) ?? instant(p.data?.at);
+/** Still to fire: not done, firing after `now`, and not after it expires: data.expires, else 12 h after the fire time.
+ *  The contract's default is data.at + 12 h; counted from the fire time instead, so "Snooze until tomorrow" still fires
+ *  (docs/(C) Lane phone notes.md). */
+function willFire(p, now) {
+  const f = fireAt(p);
+  return !!f && p.user_data?.done !== true && f > now && f <= (instant(p.data?.expires) ?? new Date(f.getTime() + 12 * 36e5));
+}
+/** The end of this week: Sunday 23:59:59.999 on this phone's clock. On a Sunday it is next Sunday, so Sunday evening
+ *  shows the week ahead (as the Mac does). */
+export function weekEnd(now) {
+  const d = new Date(now);
+  d.setDate(d.getDate() + (7 - d.getDay()));
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+/** A brief's prep time: "45 min", "2 h", "1 h 30 min". */
+export const prep = (minutes) => { const m = Math.round(Number(minutes) || 0); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}`; };
+/** "Brief · 2 h prep", or "Brief" when the brief has no minutes. */
+export const briefLabel = (note) => (Number(note.data?.minutes) > 0 ? `Brief · ${prep(note.data.minutes)} prep` : "Brief");
+const isBrief = (n) => n?.data?.kind === "pre" && !!instant(n.data?.classAt);
+
+/** Today's "Up next", from now to the end of Sunday, by day (all-day rows first) and then time: classes (timed `event`
+ *  rows starting after now, plus briefs whose class has no event row), pings still to fire, timed tasks, and
+ *  assessments due. A class with a brief carries "Brief · 2 h prep" and opens it.
+ *  Rows: {id, kind: "class" | "ping" | "task" | "assessment", day, at (ms, null = all day), time, title, sub, open, event?}. */
+export function upNext({ events = [], pings = [], tasks = [], assessments = [], notes = [] }, now = new Date()) {
+  const end = weekEnd(now), today = localDay(now), last = localDay(end), rows = [];
+  const ahead = (d) => !!d && d > now && d <= end;
+  const add = (id, kind, at, title, sub, open, more = {}) =>
+    rows.push({ id, kind, day: at ? localDay(at) : null, at: at ? at.getTime() : null, time: at ? clock(at) : null, title, sub, open, ...more });
+  const briefs = new Map(notes.filter(isBrief).map((n) => [instant(n.data.classAt).getTime(), n])), used = new Set();
+  for (const e of events) {
+    const start = instant(e.data?.start);
+    if (gone(e) || e.data?.allDay === true || !ahead(start)) continue;
+    const b = briefs.get(start.getTime());
+    if (b) used.add(b.id);
+    add(e.id, "class", start, text(e.data, "title") ?? e.title ?? "Event", [b && briefLabel(b), text(e.data, "location")].filter(Boolean).join(" · "), b ? `note:${b.id}` : null, { event: true });
+  }
+  for (const [at, b] of briefs) {
+    if (!used.has(b.id) && ahead(new Date(at))) add(b.id, "class", new Date(at), b.title ?? "Class", [briefLabel(b), text(b.data, "where")].filter(Boolean).join(" · "), `note:${b.id}`);
+  }
+  // Class nudges and event pings are left out: their class or event is already a row (as on the Mac).
+  for (const p of pings) if (willFire(p, now) && fireAt(p) <= end && !["nudge", "event"].includes(p.data?.kind)) add(p.id, "ping", fireAt(p), p.title ?? "Reminder", "Notification", text(p.data, "open")?.replace(/^reask:/, "note:"));
+  for (const t of tasks) {
+    const at = remindAt(t);
+    if (!gone(t) && ahead(at)) add(t.id, "task", at, text(t.data, "title") ?? t.title ?? "Task", text(t.data, "origin") ?? "", `item:${t.id}`);
+  }
+  for (const a of own(assessments.filter((x) => !gone(x)))) {
+    const day = isDay(a.date) ? a.date.slice(0, 10) : null;
+    if (day && day >= today && day <= last) {
+      add(a.id, "assessment", null, (text(a.data, "title") ?? a.title ?? "Assessment") + " due", [a.module, text(a.data, "weight")].filter(Boolean).join(" · "), `item:${a.id}`, { day });
+    }
+  }
+  return rows.sort((x, y) => cmp(x.day, y.day) || (x.at ?? -Infinity) - (y.at ?? -Infinity) || cmp(x.title, y.title));
+}
+
+/** The Inbox: every ping whose fire time has come, newest first. Unread = no seenAt and not done. */
+export function inbox(pings, now = new Date()) {
+  const rows = pings.map((p) => ({ p, at: fireAt(p) })).filter((x) => x.at && x.at <= now)
+    .sort((a, b) => b.at - a.at || cmp(a.p.id, b.p.id)).map((x) => x.p);
+  return { rows, unread: rows.filter((p) => !p.user_data?.seenAt && p.user_data?.done !== true).length };
+}
+
+/** Snooze choices still ahead of `now`, [label, Date]: 1 hour, 20:00 tonight and 08:00 tomorrow. */
+export function snoozeChoices(now = new Date()) {
+  const at = (days, hour) => { const d = new Date(now); d.setDate(d.getDate() + days); d.setHours(hour, 0, 0, 0); return d; };
+  return [["Snooze 1 hour", new Date(now.getTime() + 36e5)], ["Snooze until tonight", at(0, 20)], ["Snooze until tomorrow", at(1, 8)]].filter(([, d]) => d > now);
+}
+
+/** `listen:next`: the brief for the next class still to start, or null. */
+export const nextBrief = (notes, now = new Date()) =>
+  notes.filter((n) => isBrief(n) && instant(n.data.classAt) > now).sort((a, b) => instant(a.data.classAt) - instant(b.data.classAt))[0] ?? null;
+
 /** "just now", "2 min ago", "at 09:14", "on Tue 6 Oct". */
 export function ago(then, now = Date.now()) {
   const mins = Math.floor((now - then) / 60000);
