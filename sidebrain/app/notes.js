@@ -138,13 +138,19 @@ export function lectureDoc(json, state = {}, sections = []) {
   return parts.some((p) => p != null) ? parts.join("") : null;
 }
 
+const TEXT = ["h1", "h2", "h3", "p", "meta", "quote", "callout"], LISTS = ["inshort", "bullets", "numbers", "sources"];
+/** Nothing to show: blank text, no non-blank item, a table without rows (LectureDoc.Block.hasContent). Skipped like an
+ *  unknown block, so a note a model padded with empty blocks reads clean. Brief blocks are never judged here. */
+const empty = (b, text, items) =>
+  TEXT.includes(b.t) ? !text.trim() : LISTS.includes(b.t) ? !items.some((x) => x.trim()) : b.t === "table" && !arr(b.rows).some(Array.isArray);
+
 function block(b, i, state, sections, n) {
   const text = str(b.text), items = arr(b.items).filter((x) => typeof x === "string");
+  if (empty(b, text, items)) return null;
   const list = (tag) => `<${tag}>${items.map((x) => `<li>${inline(x)}</li>`).join("")}</${tag}>`;
   switch (b.t) {
     case "h1": return "";
     case "h2":
-      if (!text) return "";
       sections.push({ id: `sec-${i}`, title: plain(text) });
       return `<h3 class="doc-h2" id="sec-${i}">${inline(text)}</h3>`;
     case "h3": return `<h4>${inline(text)}</h4>`;

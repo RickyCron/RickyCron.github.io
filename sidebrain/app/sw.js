@@ -1,7 +1,7 @@
 // Sidebrain phone app service worker: keeps the app shell (and the pinned supabase-js module) cached so the
 // app opens offline, shows the daily reminder, and sets the Home Screen badge. Card data is never cached here;
 // app.js keeps its own copy in localStorage and Supabase stays the source of truth.
-const CACHE = "sidebrain-v11"; // bump when the shell changes (v11: pings, Inbox, Up next, brief blocks and audio; v10: design round 3 labels)
+const CACHE = "sidebrain-v12"; // bump when the shell changes (v12: empty doc blocks skipped; v11: pings, Inbox, Up next, brief blocks and audio; v10: design round 3 labels)
 const SHELL = ["./", "index.html", "styles.css", "app.js", "sm2.js", "today.js", "notes.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "apple-touch-icon.png"];
 
 // GitHub Pages sends max-age=600, so every fetch of our own files skips the HTTP cache: the cached shell is
