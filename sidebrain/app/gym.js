@@ -10,6 +10,7 @@ const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 // ---- The plan: (C) Gym & Running Plan — Autumn 2026.md (28 Sept), rugby Tue + Sat, match Wed ----
 // kind: "load" (kg × reps), "reps" (bodyweight reps), "time" (seconds or minutes, ticked done). inc: kg added by R1.
 // main: a main lift (R6 never cuts it, the light week keeps it). lower: heavy legs (R2). rest: seconds between sets.
+// alts: what the session's Swap sheet offers, the plan's own "or" first.
 const ex = (id, name, sets, lo, hi, o = {}) => ({ id, name, sets, lo, hi, kind: "load", inc: 2.5, main: false, lower: false, rest: 90, start: null, ...o });
 export const PLAN = {
   // Deload and light weeks by their Monday: the plan calls them "week 7" and "week 12", but its own dates (w/c 2 Nov, 7 Dec)
@@ -17,33 +18,33 @@ export const PLAN = {
   start: "2026-09-28", end: "2026-12-12", deload: ["2026-11-02"], light: ["2026-12-07"], matchDay: 3,
   sessions: {
     A: { day: 1, name: "Upper strength + power", items: [
-      ex("box-jump", "Box jumps", 3, 5, 5, { kind: "reps", rest: 90, note: "Full reset each rep" }),
-      ex("bench", "Bench press", 4, 4, 5, { main: true, start: 117.5, rest: 180 }),
-      ex("pull-up", "Weighted pull-up", 4, 5, 8, { start: 0, rest: 150, note: "Or chest-supported row" }),
-      ex("ohp", "Overhead press", 3, 6, 8, { rest: 120, note: "Or landmine press" }),
+      ex("box-jump", "Box jumps", 3, 5, 5, { kind: "reps", rest: 90, note: "Full reset each rep" , alts: ["Broad jumps", "Med-ball slams"] }),
+      ex("bench", "Bench press", 4, 4, 5, { main: true, start: 117.5, rest: 180 , alts: ["Dumbbell bench press", "Floor press"] }),
+      ex("pull-up", "Weighted pull-up", 4, 5, 8, { start: 0, rest: 150, note: "Or chest-supported row" , alts: ["Chest-supported row", "Lat pulldown"] }),
+      ex("ohp", "Overhead press", 3, 6, 8, { rest: 120, note: "Or landmine press" , alts: ["Landmine press", "Dumbbell shoulder press"] }),
       ex("neck-a", "Neck isometrics, 4 directions", 2, 15, 15, { kind: "time", rest: 30, unit: "s" }),
     ] },
     B: { day: 0, name: "Heavy lower + pull", items: [
-      ex("squat", "Back squat", 4, 4, 6, { main: true, lower: true, inc: 5, start: 117.5, rest: 180 }),
-      ex("deadlift", "Deadlift (hex bar)", 4, 4, 6, { main: true, lower: true, inc: 5, start: 145, rest: 180 }),
-      ex("row", "Barbell row", 3, 8, 8, { rest: 120 }),
-      ex("nordic-b", "Nordic hamstring curls", 3, 3, 5, { kind: "reps", lower: true, rest: 120 }),
-      ex("copenhagen", "Copenhagen adduction, per side", 2, 6, 8, { kind: "reps", rest: 60 }),
+      ex("squat", "Back squat", 4, 4, 6, { main: true, lower: true, inc: 5, start: 117.5, rest: 180 , alts: ["Front squat", "Safety bar squat"] }),
+      ex("deadlift", "Deadlift (hex bar)", 4, 4, 6, { main: true, lower: true, inc: 5, start: 145, rest: 180 , alts: ["Conventional deadlift", "Romanian deadlift"] }),
+      ex("row", "Barbell row", 3, 8, 8, { rest: 120 , alts: ["Chest-supported row", "Seal row"] }),
+      ex("nordic-b", "Nordic hamstring curls", 3, 3, 5, { kind: "reps", lower: true, rest: 120 , alts: ["Razor curls", "Lying leg curl"] }),
+      ex("copenhagen", "Copenhagen adduction, per side", 2, 6, 8, { kind: "reps", rest: 60 , alts: ["Short-lever Copenhagen", "Cable adduction"] }),
       ex("neck-b", "Neck isometrics", 2, 15, 15, { kind: "time", rest: 30, unit: "s" }),
     ] },
     C: { day: 4, name: "Light upper + prehab", items: [
-      ex("incline-db", "Incline dumbbell press", 3, 8, 10, { inc: 2, rest: 90 }),
-      ex("cs-row", "Chest-supported row", 3, 10, 10, { rest: 90 }),
-      ex("face-pull", "Face pulls", 3, 15, 15, { kind: "reps", rest: 60 }),
-      ex("ext-rot", "Band external rotations", 2, 15, 15, { kind: "reps", rest: 45 }),
+      ex("incline-db", "Incline dumbbell press", 3, 8, 10, { inc: 2, rest: 90 , alts: ["Incline bench press", "Push-ups"] }),
+      ex("cs-row", "Chest-supported row", 3, 10, 10, { rest: 90 , alts: ["Seated cable row", "Dumbbell row"] }),
+      ex("face-pull", "Face pulls", 3, 15, 15, { kind: "reps", rest: 60 , alts: ["Band pull-aparts", "Rear-delt fly"] }),
+      ex("ext-rot", "Band external rotations", 2, 15, 15, { kind: "reps", rest: 45 , alts: ["Cable external rotation"] }),
       ex("arms", "Arms (optional)", 2, 12, 12, { rest: 60 }),
-      ex("bike-c", "Easy bike", 1, 20, 20, { kind: "time", unit: "min", rest: 0 }),
+      ex("bike-c", "Easy bike", 1, 20, 20, { kind: "time", unit: "min", rest: 0 , alts: ["Easy row", "Easy walk"] }),
     ] },
     D: { day: 5, name: "Intervals + Nordics", items: [
       ex("warm-up", "Warm-up", 1, 10, 10, { kind: "time", unit: "min", rest: 0 }),
-      ex("intervals", "6 min of 15 s on / 15 s off", 3, 6, 6, { kind: "time", unit: "min", rest: 180, conditioning: true, note: "55–60 m per 15 s rep" }),
-      ex("nordic-d", "Nordics (light)", 2, 3, 3, { kind: "reps", lower: true, rest: 90 }),
-      ex("pallof", "Pallof press, per side", 2, 10, 10, { kind: "reps", rest: 60 }),
+      ex("intervals", "6 min of 15 s on / 15 s off", 3, 6, 6, { kind: "time", unit: "min", rest: 180, conditioning: true, note: "55–60 m per 15 s rep" , alts: ["Bike intervals", "Rower intervals"] }),
+      ex("nordic-d", "Nordics (light)", 2, 3, 3, { kind: "reps", lower: true, rest: 90 , alts: ["Razor curls", "Lying leg curl"] }),
+      ex("pallof", "Pallof press, per side", 2, 10, 10, { kind: "reps", rest: 60 , alts: ["Dead bug", "Side plank"] }),
     ] },
   },
 };
@@ -65,7 +66,7 @@ export const sessionsOf = (rows) => rows.filter((r) => r.data?.type === "session
 /** The last time an exercise was done: {date, sets, deload}, sets being the ticked ones only. */
 export function lastTime(id, sessions) {
   for (const s of sessions) {
-    const sets = (s.data.sets ?? []).filter((x) => x.ex === id && x.done);
+    const sets = (s.data.sets ?? []).filter((x) => x.ex === id && x.done && !x.swap); // a swapped-in lift never moves the plan's load
     if (sets.length) return { date: s.date, sets, deload: !!s.data.deload };
   }
   return null;
@@ -148,11 +149,16 @@ export function warnings(key, day, now, profile = {}, doneToday = []) {
   return [...new Set(out)];
 }
 
-/** R5 on demand: the last two sessions both rated wrecked 4 or 5, and no deload under way. */
+/** How a session left you, asked when it's finished: 1 Fine, 2 Tired, 3 Wrecked. */
+export const WRECKED = ["Fine", "Tired", "Wrecked"];
+/** How you feel before it: 1 Rough, 2 OK, 3 Good. */
+export const FEEL = ["Rough", "OK", "Good"];
+
+/** R5 on demand: the last two sessions both rated Wrecked, and no deload under way. */
 export function deloadOffer(sessions, day, profile = {}) {
   if (phaseOf(day, profile) === "deload") return false;
   const [a, b] = sessions;
-  return !!(a && b && (a.data.wrecked ?? 0) >= 4 && (b.data.wrecked ?? 0) >= 4);
+  return !!(a && b && (a.data.wrecked ?? 0) >= 3 && (b.data.wrecked ?? 0) >= 3);
 }
 
 /** This week (Mon–Sun): each plan session with its day and whether it was done; missed ones stay missed (R4: never stacked). */

@@ -69,7 +69,7 @@ async function start() {
   for (const form of document.querySelectorAll("form.compose")) form.innerHTML = composer();
   bind();
   train.mount({ sb: () => sb, user: () => user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY,
-                demo: DEMO, keep, load, rerender: () => render() });
+                demo: DEMO, keep, load, rerender: () => render(), tab: () => switchTab("train") });
   setInterval(tickClock, 60000);
   if (DEMO) {
     user = { email: "Demo" };
@@ -1403,6 +1403,7 @@ function renderSheet() {
         <input type="checkbox" switch id="remind" ${reminders === "on" ? "checked" : ""} ${["on", "off"].includes(reminders) ? "" : "disabled"} aria-label="Morning reminder"></label></li>
       <li><label class="row">${ICON.person}<span class="text"><span class="title">Train</span><span class="subtitle">Gym plan, logging, bodyweight and food</span></span>
         <input type="checkbox" switch id="train-on" ${trainOn ? "checked" : ""} aria-label="Train"></label></li>
+      ${trainOn ? train.accountRows() : ""}
       ${DEMO ? "" : row({ lead: ICON.sync, title: "Sync", sub: signedOutOfSync && waiting ? `Sign in again to sync ${plural(waiting, "change")}` : "",
         trail: waiting ? `${waiting} waiting` : "Up to date" }).replace('class="subtitle"', 'class="subtitle warn"')}
     </ul>
