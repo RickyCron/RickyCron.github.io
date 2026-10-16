@@ -517,21 +517,51 @@ html[data-nav] .dock { view-transition-name: dock; }
   .group, .flash { box-shadow: inset 0 0 0 1px var(--separator); }
 }
 
-/* ---------- Train (train.js), only drawn while the plugin is on ---------- */
+/* ---------- Train (train.js), only drawn while the plugin is on ----------
+   Every control here is drawn by the app (no native switches or number spinners), so it looks the same in Safari and Chrome. */
 .tabs.five { grid-template-columns: repeat(5, 1fr); }
 .tabs.five .lens { width: calc((100% - 8px) / 5); }
 .tabs button[hidden] { display: none; }
-.gym-seg { margin-top: 8px; }
-.gym-seg button[aria-checked="true"] { color: var(--ink); }
-.gym-seg button[aria-checked="true"]::before { content: ""; position: absolute; inset: 6px 2px; z-index: -1; border-radius: 999px; background: var(--thumb); box-shadow: 0 3px 8px rgb(0 0 0 / .12); }
-.gym-num { width: 76px; flex: none; text-align: right; font: var(--body); font-variant-numeric: tabular-nums; color: var(--label); background: var(--fill); border: 0; border-radius: 10px; padding: 7px 10px; }
-.gym-num.short { width: 56px; }
-.gym-rir, .row select { flex: none; font: var(--body); color: var(--label-2); background: var(--fill); border: 0; border-radius: 10px; padding: 7px 8px; }
+
+/* Number fields: a small filled pill on the right of a row, unit after it. */
+.gym-field { flex: none; display: flex; align-items: center; gap: 6px; }
+.gym-input { width: 72px; height: 36px; padding: 0 10px; border-radius: 10px; background: var(--fill); text-align: center; font: var(--body); font-variant-numeric: tabular-nums; caret-color: var(--accent-text); }
+.gym-input.short { width: 60px; }
+.gym-input::placeholder, .gym-text::placeholder { color: var(--label-3); }
+.gym-input:focus-visible, .gym-text:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 0; }
+.gym-unit { color: var(--label-2); font: var(--foot); min-width: 10px; }
+.gym-text { display: block; width: 100%; height: 52px; padding: 0 16px; font: var(--body); caret-color: var(--accent-text); }
+
+/* Tick rows (iOS selection list): the check sits on the right, in the accent. */
+.gym-pick { text-align: left; width: 100%; }
+.gym-check { width: 22px; height: 22px; flex: none; fill: none; stroke: var(--accent-text); stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Setup: step dots, day chips, the sessions stepper, and the actions pinned under the content. */
+.gym-steps { display: flex; gap: 6px; margin: 4px 0 16px; }
+.gym-steps i { flex: 1; height: 4px; border-radius: 2px; background: var(--fill); transition: background-color 250ms; }
+.gym-steps i.on { background: var(--accent); }
+.gym-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.gym-days button { display: grid; place-items: center; height: 44px; border-radius: 12px; background: var(--surface); font: var(--headline); color: var(--label); transition: background-color 150ms, color 150ms; }
+.gym-days button[aria-pressed="true"] { background: var(--accent); color: var(--ink); }
+.gym-stepper { display: flex; align-items: center; justify-content: space-between; height: 60px; padding: 0 12px; border-radius: 24px; background: var(--surface); }
+.gym-stepper b { font: var(--large); font-variant-numeric: tabular-nums; }
+.gym-stepper .circle { width: 40px; height: 40px; border-radius: 50%; background: var(--fill); font: 500 1.4rem/1 var(--sf); }
+.gym-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 28px; }
+
+/* Feel and wrecked: five equal pills; the chosen one is filled. */
+.gym-seg { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 8px; height: auto; }
+.gym-seg::before { display: none; }
+.gym-seg button { display: grid; place-items: center; height: 44px; border-radius: 12px; background: var(--surface); font: var(--headline); color: var(--label); }
+.gym-seg button[aria-checked="true"] { background: var(--accent); color: var(--ink); }
+
+/* A set: tick, label, kg × reps, RIR. */
 .gym-set { gap: 8px; }
+.gym-set .text { min-width: 40px; }
+.gym-rir { flex: none; height: 36px; padding: 0 8px; border-radius: 10px; background: var(--fill); font: var(--body); color: var(--label); }
 .gym-ex-actions { display: flex; gap: 20px; justify-content: flex-end; margin-top: 8px; font: var(--foot); }
-.gym-ex-actions .link { color: var(--accent-text); }
-.gym-rest { position: sticky; top: calc(env(safe-area-inset-top) + 52px); z-index: 5; display: flex; align-items: center; gap: 12px; margin-top: 12px;
-  padding: 10px 10px 10px 18px; border-radius: 999px; background: var(--chrome); -webkit-backdrop-filter: blur(14px) saturate(180%); backdrop-filter: blur(14px) saturate(180%); box-shadow: var(--chrome-edge), var(--chrome-shadow); }
+.gym-ex-actions button { color: var(--accent-text); font-weight: 600; }
+.gym-rest { position: sticky; top: calc(env(safe-area-inset-top) + 56px); z-index: 5; display: flex; align-items: center; gap: 12px; margin-top: 12px;
+  padding: 8px 8px 8px 20px; border-radius: 999px; background: var(--chrome); -webkit-backdrop-filter: blur(14px) saturate(180%); backdrop-filter: blur(14px) saturate(180%); box-shadow: var(--chrome-edge), var(--chrome-shadow); }
 .gym-rest[hidden] { display: none; }
 .gym-rest span { flex: 1; color: var(--label-2); }
 .gym-rest b { font: var(--section); font-variant-numeric: tabular-nums; }

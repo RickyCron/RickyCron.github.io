@@ -8,7 +8,7 @@ import { todayString, addDays } from "./sm2.js";
 let ctx = null;                  // {sb, user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url, anon, demo, keep, load, rerender}
 let rows = [];                   // gym items: this phone's copy, merged with the server's
 let live = null;                 // the session in progress (kept in localStorage, so a locked phone or a reload loses nothing)
-let feel = 0, wrecked = 0, editing = false, status = "", whoop = { connected: null, recovery: null, day: "" };
+let feel = 0, wrecked = 0, editing = false, others = false, status = "", whoop = { connected: null, recovery: null, day: "" };
 let food = { items: [], note: "", busy: false, error: "", photo: null };
 let tickTimer = null;
 
@@ -29,6 +29,7 @@ export function mount(c) {
   for (const el of [$("train"), sheet]) {
     el.addEventListener("click", click);
     el.addEventListener("change", change);
+    el.addEventListener("input", input);
   }
   const link = new URLSearchParams(location.search).get("whoop");
   if (link) status = link === "connected" ? "WHOOP connected." : "WHOOP didn’t connect. Try again.";
@@ -139,16 +140,16 @@ function home() {
         trail: e.load != null ? `${kg(e.load)}${e.up ? " ↑" : ""}` : "" })).join("")}</ul>
         <p class="foot mt-20">How do you feel?</p>${seg("feel", feel)}
         <button class="btn primary mt-12" type="button" data-g="start" data-key="${key}">Start</button>`;
-    } else out += `<h2 class="section">Today</h2><p class="sub">${[2, 6].includes(new Date().getDay()) ? "Rugby training." : new Date().getDay() === p.matchDay ? "Match day." : "Rest day."} Nothing in the gym.</p>`;
-    out += `<ul class="group flat mt-12">${KEYS.filter((k) => k !== key).map((k) => ctx.row({ tag: "button", attrs: `data-g="other" data-key="${k}"`,
-      title: `Do ${PLAN.sessions[k].name} instead`, chev: true, cls: "fold" })).join("")}</ul>`;
+    } else out += `<h2 class="section">Today</h2><p class="sub">${new Date().getDay() === p.matchDay ? "Match day." : (p.rugbyDays ?? [2, 6]).includes(new Date().getDay()) ? "Rugby training." : "Rest day."} Nothing in the gym.</p>`;
+    out += `<ul class="group flat mt-20">${ctx.row({ tag: "button", attrs: `data-g="others" aria-expanded="${others}"`, title: key ? "Do a different session" : "Do a session anyway", cls: "fold" })}
+      ${others ? KEYS.filter((k) => k !== key).map((k) => ctx.row({ tag: "button", attrs: `data-g="other" data-key="${k}"`, title: esc(PLAN.sessions[k].name), chev: true })).join("") : ""}</ul>`;
     if (deloadOffer(sessions, today, p)) out += `<ul class="group mt-12">${ctx.row({ tag: "button", attrs: `data-g="deload"`, lead: ctx.ICON.sunrise,
       title: "Take a deload week", sub: "Your last two sessions felt wrecked. Half the sets for 7 days, same loads." })}</ul>`;
   }
   out += `<h2 class="section">This week · ${wk.count} of ${p.target ?? 4}</h2><ul class="group">${wk.slots.map((s) => ctx.row({
     lead: s.state === "done" ? ctx.ICON.check.replace('class="glyph"', 'class="glyph success"') : ctx.ICON.calendar,
     title: esc(PLAN.sessions[s.key].name), sub: new Date(s.day + "T12:00").toLocaleDateString("en-GB", { weekday: "long" }),
-    trail: { done: "Done", missed: "Missed", today: "Today", later: "" }[s.state], trailCls: s.state === "missed" ? "warn" : "" })).join("")}</ul>`;
+    trail: { done: "Done", missed: "Missed", today: "Today", later: "" }[s.state] })).join("")}</ul>`;
   out += bodyweight(today) + foodSection(today) + history(sessions) + settings();
   return out;
 }
@@ -160,16 +161,14 @@ function bodyweight(today) {
     : t.change == null ? `7-day average ${t.avg} kg. The weekly change shows after a second week.`
     : `7-day average ${t.avg} kg, ${t.change >= 0 ? "+" : ""}${t.change} kg on last week. Aim for +${t.lo} to +${t.hi}.`;
   const nudge = { low: "Gaining slower than the aim: add a snack or a bigger portion.", high: "Gaining faster than the aim: some of that is likely fat.", flat: "Flat for two weeks: eat more." }[t?.status] ?? "";
-  return `<h2 class="section">Bodyweight</h2><ul class="group flat"><li class="field gym-inline"><label class="row">
-    <span class="text"><span class="title">This morning</span></span>
-    <input class="gym-num" type="number" inputmode="decimal" step="0.1" min="30" max="250" data-g="weight" value="${todays?.kg ?? ""}" placeholder="kg" aria-label="Bodyweight in kg"></label></li></ul>
+  return `<h2 class="section">Bodyweight</h2><ul class="group flat">${field("This morning", "weight", todays?.kg ?? "", "kg", `placeholder="–" aria-label="Bodyweight in kg"`)}</ul>
     <p class="foot mt-12">${esc(line)}</p>${nudge ? `<p class="foot">${esc(nudge)}</p>` : ""}`;
 }
 
 function foodSection(today) {
   const meals = of("meal").filter((m) => m.date === today), totals = dayFood(of("meal"), today), target = PROTEIN_TARGET(profile()?.weight);
   return `<h2 class="section">Food</h2><ul class="group">
-    ${ctx.row({ title: `Protein today: about ${totals.protein} g of ${target} g`, sub: "Photo estimates read low on big portions. Treat this as a floor." })}
+    ${ctx.row({ title: `Protein today: about ${totals.protein} g of ${target} g`, sub: "Photo estimates read low. Treat it as a floor." })}
     ${meals.map((m) => ctx.row({ title: esc(m.data.note || m.data.items.map((i) => i.name).join(", ")), sub: m.data.items.map((i) => esc(i.name)).join(" · "),
       trail: `${m.data.items.reduce((a, i) => a + i.protein_g, 0)} g` })).join("")}
     ${ctx.row({ tag: "button", attrs: `data-g="food"`, lead: ctx.ICON.camera, title: "Add a meal", chev: true })}</ul>`;
@@ -189,78 +188,87 @@ function settings() {
   const w = whoop.connected === true ? `Connected${whoop.recovery != null ? ` · recovery ${whoop.recovery}%` : ""}` : whoop.connected === false ? "Not connected" : "";
   return `<ul class="group mt-28">
     ${ctx.row({ tag: whoop.connected === true ? "div" : "button", attrs: `data-g="whoop"`, lead: ctx.ICON.sync, title: "WHOOP",
-      sub: whoop.connected === true ? "Strain and heart rate come back after each session" : "Start the activity on your band; strain comes back here", trail: w, chev: whoop.connected !== true })}
+      sub: whoop.connected === true ? "Strain comes back after each session" : "Connect to bring strain back", trail: w, chev: whoop.connected !== true })}
     ${ctx.row({ tag: "button", attrs: `data-g="edit"`, lead: ctx.ICON.person, title: "Your answers", chev: true })}</ul>`;
 }
 
-// ---------- Onboarding (research doc §2): one sheet, every answer editable later ----------
+// ---------- Setup (research doc §2): four short steps, every answer editable later ----------
+// Only what the plan uses: the health screen, injuries, bodyweight (protein target), a recent heavy set per main lift
+// (start loads), and the week (match day for R2, rugby days for the Today line, sessions a week for the count).
 
 const PARQ = [
-  "Has a doctor ever said you have a heart condition or high blood pressure?",
-  "Do you feel pain in your chest at rest, in daily life, or when you exercise?",
-  "In the last 12 months, have you lost balance from dizziness or lost consciousness?",
-  "Have you been diagnosed with another chronic medical condition?",
-  "Do you take prescribed medicine for a chronic condition?",
-  "Do you have a bone, joint or soft-tissue problem that more activity could make worse?",
-  "Has a doctor said you should only do medically supervised activity?",
+  "A doctor has said you have a heart condition or high blood pressure",
+  "You get chest pain at rest, in daily life or when you exercise",
+  "You've lost balance from dizziness, or lost consciousness, in the last 12 months",
+  "You have another chronic medical condition",
+  "You take prescribed medicine for a chronic condition",
+  "You have a bone, joint or soft-tissue problem that more activity could make worse",
+  "A doctor has said you should only do medically supervised activity",
 ];
 const LIFTS = [["bench", "Bench press"], ["squat", "Back squat"], ["deadlift", "Deadlift"], ["row", "Barbell row"]];
-const GOALS = [["rugby", "Rugby performance"], ["size", "Size"], ["strength", "Strength"], ["race", "A race (Hyrox)"]];
+const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]; // index i is weekday (i + 1) % 7
+const STEPS = ["Health", "Injuries", "You", "Your week"];
+let draft = null; // the setup being filled in: {step, ...answers}
 
-function onboarding() {
-  const a = profile() ?? {}, v = (k) => esc(a[k] ?? ""), yes = (k) => (a[k] ? "checked" : "");
-  const check = (name, label, on) => `<li><label class="row"><span class="text"><span class="title">${esc(label)}</span></span><input type="checkbox" switch name="${name}" ${on}></label></li>`;
-  const text = (name, label, attrs = "") => `<li class="field"><label class="row"><span class="text"><span class="title">${esc(label)}</span></span><input class="gym-num" name="${name}" value="${v(name)}" ${attrs}></label></li>`;
-  return `${ctx.head(profile() ? "Your answers" : "Set up Train", "About two minutes. Change any of it later.")}
-  <form id="gym-setup" autocomplete="off">
-    <h2 class="section">Health check</h2><p class="foot">The PAR-Q+ first page, in short. Full form at eparmedx.com.</p>
-    <ul class="group flat mt-12">${PARQ.map((q, i) => check(`parq${i}`, q, yes(`parq${i}`))).join("")}</ul>
-    <ul class="group flat mt-12">${text("injury", "Injury affecting training", `placeholder="None"`)}
-      ${check("surgery", "Surgery in the last 12 months", yes("surgery"))}${check("concussion", "Concussion this season", yes("concussion"))}</ul>
-    <h2 class="section">You</h2><ul class="group flat">${text("age", "Age", `type="number" inputmode="numeric"`)}${text("height", "Height (cm)", `type="number" inputmode="numeric"`)}
-      ${text("weight", "Bodyweight (kg)", `type="number" inputmode="decimal" step="0.1"`)}${text("years", "Years of steady lifting", `type="number" inputmode="decimal"`)}</ul>
-    <h2 class="section">Goal</h2><ul class="group flat"><li><label class="row"><span class="text"><span class="title">Main goal</span></span>
-      <select name="goal">${GOALS.map(([k, l]) => `<option value="${k}" ${a.goal === k ? "selected" : ""}>${l}</option>`).join("")}</select></label></li>
-      <li><label class="row"><span class="text"><span class="title">Second goal</span></span><select name="goal2"><option value="">None</option>${GOALS.map(([k, l]) => `<option value="${k}" ${a.goal2 === k ? "selected" : ""}>${l}</option>`).join("")}</select></label></li></ul>
-    <h2 class="section">A recent heavy set</h2><p class="foot">Weight × reps. Start loads are 90% of the 5-rep max it implies.</p>
-    <ul class="group flat mt-12">${LIFTS.map(([id, l]) => `<li class="field"><label class="row"><span class="text"><span class="title">${l}</span></span>
-      <input class="gym-num" name="${id}-kg" type="number" inputmode="decimal" step="0.5" placeholder="kg" value="${esc(a.lifts?.[id]?.kg ?? "")}" aria-label="${l} kg">
-      <input class="gym-num short" name="${id}-reps" type="number" inputmode="numeric" placeholder="reps" value="${esc(a.lifts?.[id]?.reps ?? "")}" aria-label="${l} reps"></label></li>`).join("")}</ul>
-    <h2 class="section">Your week</h2><ul class="group flat">${text("rugby", "Rugby training", `placeholder="Tue, Sat"`)}
-      <li><label class="row"><span class="text"><span class="title">Match day</span></span><select name="matchDay">${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((d, i) =>
-        `<option value="${i}" ${(a.matchDay ?? 3) === i ? "selected" : ""}>${d}</option>`).join("")}</select></label></li>
-      ${text("target", "Gym sessions a week", `type="number" inputmode="numeric" placeholder="4"`)}${text("time", "Time per session (min)", `type="number" inputmode="numeric" placeholder="75"`)}
-      ${check("limited", "Limited equipment", yes("limited"))}</ul>
-    <h2 class="section">Leave out</h2><ul class="group flat">${KEYS.flatMap((k) => PLAN.sessions[k].items).filter((e, i, all) => all.findIndex((x) => x.name === e.name) === i)
-      .map((e) => check(`avoid-${e.id}`, e.name, (a.avoid ?? []).includes(e.id) ? "checked" : "")).join("")}</ul>
-    <button class="btn primary mt-20" type="submit">${profile() ? "Save" : "Start training"}</button>
-    ${profile() ? `<button class="btn plain mt-12" type="button" data-g="cancel">Cancel</button>` : ""}
-    <p class="foot" id="gym-setup-status" role="status"></p>
-  </form>`;
+function startSetup() {
+  const a = profile() ?? {};
+  draft = { step: 0, parq: PARQ.map((_, i) => !!a[`parq${i}`]), injury: a.injury ?? "", surgery: !!a.surgery, concussion: !!a.concussion,
+    weight: a.weight ?? "", lifts: structuredClone(a.lifts ?? {}), rugbyDays: a.rugbyDays ?? [2, 6], matchDay: a.matchDay ?? 3, target: a.target ?? 4 };
 }
 
-function submitSetup(form) {
-  const f = new FormData(form), n = (k) => (f.get(k) === "" || f.get(k) == null ? null : Number(f.get(k)));
-  const a = { parq: PARQ.map((_, i) => f.get(`parq${i}`) === "on") };
-  PARQ.forEach((_, i) => { a[`parq${i}`] = a.parq[i]; });
-  Object.assign(a, { injury: String(f.get("injury") ?? "").trim(), surgery: f.get("surgery") === "on", concussion: f.get("concussion") === "on",
-    age: n("age"), height: n("height"), weight: n("weight"), years: n("years"), goal: f.get("goal"), goal2: f.get("goal2") || null,
-    rugby: String(f.get("rugby") ?? "").trim(), matchDay: n("matchDay") ?? 3, target: n("target") ?? 4, time: n("time"), limited: f.get("limited") === "on" });
-  a.lifts = {}; a.starts = {};
+const check = `<svg class="gym-check" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12.5l4.25 4.25L18.5 7.5"/></svg>`;
+const pick = (attrs, title, on) => `<li><button type="button" class="row gym-pick" ${attrs} aria-pressed="${on}"><span class="text"><span class="title">${esc(title)}</span></span>${on ? check : ""}</button></li>`;
+const field = (label, g, value, unit, extra = "") => `<li><label class="row"><span class="text"><span class="title">${esc(label)}</span></span>
+  <span class="gym-field"><input class="gym-input" type="text" inputmode="decimal" data-g="${g}" value="${esc(value)}" ${extra}>${unit ? `<span class="gym-unit">${unit}</span>` : ""}</span></label></li>`;
+
+function onboarding() {
+  if (!draft) startSetup();
+  const d = draft, last = d.step === STEPS.length - 1;
+  let body = "";
+  if (d.step === 0) body = `${ctx.head("Health check", "Tick anything that's true for you.")}
+    <ul class="group flat mt-20">${PARQ.map((q, i) => pick(`data-g="parq" data-i="${i}"`, q, d.parq[i])).join("")}</ul>
+    <p class="foot mt-12">${d.parq.some(Boolean) ? "See a doctor or physio before you train hard. You can still set up." : "Nothing ticked means you're clear to train."} From the PAR-Q+ (eparmedx.com).</p>`;
+  if (d.step === 1) body = `${ctx.head("Injuries", "So the plan can work around them.")}
+    <ul class="group flat mt-20"><li><input class="gym-text" type="text" data-g="injury" value="${esc(d.injury)}" placeholder="Anything that hurts or limits you" aria-label="Injuries" autocapitalize="sentences"></li></ul>
+    <ul class="group flat mt-20">${pick(`data-g="surgery"`, "Surgery in the last 12 months", d.surgery)}${pick(`data-g="concussion"`, "Concussion this season", d.concussion)}</ul>
+    ${d.concussion ? `<p class="foot mt-12">Follow World Rugby's graduated return before lifting heavy.</p>` : ""}`;
+  if (d.step === 2) body = `${ctx.head("You", "Your weight sets the protein target. A recent heavy set sets your starting loads.")}
+    <ul class="group flat mt-20">${field("Bodyweight", "bw", d.weight, "kg", `aria-label="Bodyweight in kg"`)}</ul>
+    <h2 class="section">A recent heavy set</h2>
+    <ul class="group flat">${LIFTS.map(([id, name]) => `<li><div class="row"><span class="text"><span class="title">${name}</span></span>
+      <span class="gym-field"><input class="gym-input" type="text" inputmode="decimal" data-g="lift-kg" data-id="${id}" value="${esc(d.lifts[id]?.kg ?? "")}" placeholder="kg" aria-label="${name} kg">
+      <span class="gym-unit">×</span><input class="gym-input short" type="text" inputmode="numeric" data-g="lift-reps" data-id="${id}" value="${esc(d.lifts[id]?.reps ?? "")}" placeholder="reps" aria-label="${name} reps"></span></div></li>`).join("")}</ul>
+    <p class="foot mt-12">Leave any blank to start from the plan's loads.</p>`;
+  if (d.step === 3) body = `${ctx.head("Your week", "So heavy legs stay clear of matches.")}
+    <h2 class="section">Rugby training</h2>${days("rugby", d.rugbyDays)}
+    <h2 class="section">Match day</h2>${days("match", [d.matchDay])}
+    <h2 class="section">Gym sessions a week</h2>
+    <div class="gym-stepper"><button type="button" class="circle" data-g="target" data-v="-1" aria-label="Fewer">−</button><b>${d.target}</b><button type="button" class="circle" data-g="target" data-v="1" aria-label="More">+</button></div>`;
+  return `<p class="gym-steps" aria-label="Step ${d.step + 1} of ${STEPS.length}">${STEPS.map((t, i) => `<i class="${i <= d.step ? "on" : ""}"></i>`).join("")}</p>
+    ${body}
+    <div class="gym-actions"><button class="btn primary" type="button" data-g="next">${last ? (profile() ? "Save" : "Start training") : "Continue"}</button>
+    ${d.step > 0 ? `<button class="btn plain" type="button" data-g="back">Back</button>` : profile() ? `<button class="btn plain" type="button" data-g="cancel">Cancel</button>` : ""}</div>`;
+}
+const days = (g, on) => `<div class="gym-days" role="group">${DAYS.map((n, i) => {
+  const wd = (i + 1) % 7;
+  return `<button type="button" data-g="${g}" data-v="${wd}" aria-pressed="${on.includes(wd)}" aria-label="${n}">${n[0]}</button>`;
+}).join("")}</div>`;
+
+function finishSetup() {
+  const d = draft, n = (v) => { const x = parseFloat(String(v).replace(",", ".")); return Number.isFinite(x) && x > 0 ? x : null; };
+  const a = { injury: d.injury.trim(), surgery: d.surgery, concussion: d.concussion, weight: n(d.weight), rugbyDays: d.rugbyDays, matchDay: d.matchDay,
+    target: d.target, lifts: {}, starts: {}, avoid: profile()?.avoid ?? [], deloadFrom: profile()?.deloadFrom ?? null };
+  d.parq.forEach((v, i) => { a[`parq${i}`] = v; });
   for (const [id] of LIFTS) {
-    const w = n(`${id}-kg`), r = n(`${id}-reps`);
-    if (w && r) { a.lifts[id] = { kg: w, reps: r }; const s = startFrom(w, r); if (s) a.starts[id] = s; }
+    const w = n(d.lifts[id]?.kg), r = n(d.lifts[id]?.reps);
+    if (w && r) { a.lifts[id] = { kg: w, reps: Math.round(r) }; const s = startFrom(w, Math.round(r)); if (s) a.starts[id] = s; }
   }
-  a.avoid = KEYS.flatMap((k) => PLAN.sessions[k].items).map((e) => e.id).filter((id) => f.get(`avoid-${id}`) === "on");
-  a.deloadFrom = profile()?.deloadFrom ?? null;
-  delete a.parq;
   const p = profileRow();
   if (p) patch(p, a); else add({ id: "gym-profile", date: null, title: "Train profile", data: { type: "profile" }, user_data: { ...a, userAt: Date.now() } });
-  status = a.parq0 || PARQ.some((_, i) => a[`parq${i}`]) || a.concussion
-    ? "You answered yes to a health question. See a doctor or physio before training hard."
-    : "";
-  editing = false;
+  status = d.parq.some(Boolean) || d.concussion ? "You ticked a health question. See a doctor or physio before training hard." : "";
+  draft = null; editing = false;
   ctx.rerender();
+  scrollTo(0, 0);
 }
 
 // ---------- The session in progress ----------
@@ -291,8 +299,8 @@ function liveScreen() {
       <button class="tick" type="button" data-g="set" data-e="${ei}" data-s="${si}" aria-label="Set ${si + 1} ${s.done ? "done" : "not done"}" aria-pressed="${s.done}">
         <svg viewBox="0 0 22 22"><circle class="ring" cx="11" cy="11" r="10"/><circle class="disc" cx="11" cy="11" r="11"/><path class="check" pathLength="1" d="M6.5 11.5l3 3 6-6.5"/></svg></button>
       <span class="text"><span class="title">Set ${si + 1}</span></span>
-      ${e.kind === "load" ? `<input class="gym-num" type="number" inputmode="decimal" step="0.5" data-g="load" data-e="${ei}" data-s="${si}" value="${s.load ?? ""}" placeholder="kg" aria-label="Set ${si + 1} kg">` : ""}
-      ${e.kind !== "time" ? `<input class="gym-num short" type="number" inputmode="numeric" data-g="reps" data-e="${ei}" data-s="${si}" value="${s.reps ?? ""}" aria-label="Set ${si + 1} reps">` : `<span class="trail">${e.hi} ${e.unit ?? "s"}</span>`}
+      ${e.kind === "load" ? `<input class="gym-input" type="text" inputmode="decimal" data-g="load" data-e="${ei}" data-s="${si}" value="${s.load ?? ""}" placeholder="kg" aria-label="Set ${si + 1} kg"><span class="gym-unit">×</span>` : ""}
+      ${e.kind !== "time" ? `<input class="gym-input short" type="text" inputmode="numeric" data-g="reps" data-e="${ei}" data-s="${si}" value="${s.reps ?? ""}" aria-label="Set ${si + 1} reps">` : `<span class="trail">${e.hi} ${e.unit ?? "s"}</span>`}
       ${e.kind === "load" ? `<select class="gym-rir" data-g="rir" data-e="${ei}" data-s="${si}" aria-label="Set ${si + 1} reps in reserve"><option value="">RIR</option>${[0, 1, 2, 3, 4].map((r) => `<option ${s.rir === r ? "selected" : ""}>${r}</option>`).join("")}</select>` : ""}
     </div></li>`).join("")}</ul>
     <div class="gym-ex-actions"><button type="button" class="link" data-g="skip" data-e="${ei}">Skip</button><button type="button" class="link" data-g="swap" data-e="${ei}">Swap</button></div>`;
@@ -370,9 +378,9 @@ function foodSheet() {
       <li class="field"><input type="text" data-g="note" value="${esc(food.note)}" placeholder="What is it? e.g. Nando's half chicken, large rice" aria-label="What is it?"></li></ul>
     <button class="btn secondary mt-12" type="button" data-g="estimate" ${food.busy || (!food.photo && !food.note.trim()) ? "disabled" : ""}>${food.busy ? "Estimating…" : "Estimate"}</button>
     ${food.error ? `<p class="foot warn">${esc(food.error)}</p>` : ""}
-    ${food.items.length ? `<ul class="group flat mt-20">${food.items.map((i, n) => `<li class="field"><label class="row"><span class="text"><span class="title">${esc(i.name)}</span>
+    ${food.items.length ? `<ul class="group flat mt-20">${food.items.map((i, n) => `<li><label class="row"><span class="text"><span class="title">${esc(i.name)}</span>
       <span class="subtitle">${i.protein_g} g protein · ${i.kcal} kcal</span></span>
-      <input class="gym-num" type="number" inputmode="numeric" data-g="grams" data-i="${n}" value="${i.grams}" aria-label="${esc(i.name)} grams"><span class="trail">g</span></label></li>`).join("")}</ul>
+      <span class="gym-field"><input class="gym-input" type="text" inputmode="numeric" data-g="grams" data-i="${n}" value="${i.grams}" aria-label="${esc(i.name)} grams"><span class="gym-unit">g</span></span></label></li>`).join("")}</ul>
       <p class="foot mt-12">About ${totals.p} g protein, ${totals.k} kcal. Fix the grams of the main item; it reads low on big portions.</p>
       <button class="btn primary mt-12" type="button" data-g="save-meal">Save</button>` : ""}</div>`;
 }
@@ -413,8 +421,16 @@ function click(ev) {
     case "finish": return finish();
     case "discard": if (confirm("Discard this session? Nothing from it is saved.")) { restTimer(null); live = null; saveLive(); ctx.rerender(); } return;
     case "deload": patch(profileRow(), { deloadFrom: todayString() }); status = "Deload week: half the sets, same loads, until next week."; return ctx.rerender();
-    case "edit": editing = true; ctx.rerender(); return scrollTo(0, 0);
-    case "cancel": editing = false; return ctx.rerender();
+    case "edit": editing = true; startSetup(); ctx.rerender(); return scrollTo(0, 0);
+    case "cancel": editing = false; draft = null; return ctx.rerender();
+    case "parq": draft.parq[Number(d.i)] = !draft.parq[Number(d.i)]; return ctx.rerender();
+    case "surgery": case "concussion": draft[d.g] = !draft[d.g]; return ctx.rerender();
+    case "rugby": { const v = Number(d.v); draft.rugbyDays = draft.rugbyDays.includes(v) ? draft.rugbyDays.filter((x) => x !== v) : [...draft.rugbyDays, v]; return ctx.rerender(); }
+    case "match": draft.matchDay = Number(d.v); return ctx.rerender();
+    case "target": draft.target = Math.min(7, Math.max(1, draft.target + Number(d.v))); return ctx.rerender();
+    case "next": if (draft.step === STEPS.length - 1) return finishSetup(); draft.step++; ctx.rerender(); return scrollTo(0, 0);
+    case "back": draft.step--; ctx.rerender(); return scrollTo(0, 0);
+    case "others": others = !others; return ctx.rerender();
     case "whoop": return connectWhoop();
     case "food": food = { items: [], note: "", busy: false, error: "", photo: null }; paintFood(); return $("food-sheet").showModal();
     case "estimate": return estimate();
@@ -424,10 +440,21 @@ function click(ev) {
   }
 }
 
+/** Typing into the setup only updates the draft: no re-render, so the keyboard stays up. */
+function input(ev) {
+  const t = ev.target, d = t.dataset;
+  if (!draft) return;
+  if (d.g === "injury") draft.injury = t.value;
+  else if (d.g === "bw") draft.weight = t.value;
+  else if (d.g === "lift-kg" || d.g === "lift-reps") (draft.lifts[d.id] ??= {})[d.g === "lift-kg" ? "kg" : "reps"] = t.value;
+}
+
+const parse = (raw) => { const x = parseFloat(String(raw).replace(",", ".")); return Number.isFinite(x) ? x : null; };
+
 async function change(ev) {
   const t = ev.target, d = t.dataset;
-  if (t.form?.id === "gym-setup") return;
-  const e = live?.items[Number(d.e)], s = e?.sets[Number(d.s)], v = t.value === "" ? null : Number(t.value);
+  if (draft && ["injury", "bw", "lift-kg", "lift-reps"].includes(d.g)) return;
+  const e = live?.items[Number(d.e)], s = e?.sets[Number(d.s)], v = t.value === "" ? null : parse(t.value);
   if (d.g === "load" && s) { s.load = v; for (const later of e.sets.slice(Number(d.s) + 1)) if (!later.done) later.load = v; saveLive(); ctx.rerender(); }
   else if (d.g === "reps" && s) { s.reps = v; saveLive(); }
   else if (d.g === "rir" && s) { s.rir = v; saveLive(); }
@@ -449,7 +476,4 @@ async function connectWhoop() {
   catch (e) { status = `WHOOP: ${e.message}`; ctx.rerender(); }
 }
 
-export function bindSubmit() {
-  document.addEventListener("submit", (ev) => { if (ev.target.id === "gym-setup") { ev.preventDefault(); submitSetup(ev.target); } });
-}
 export const exerciseName = (id) => exerciseById(id)?.name ?? id;

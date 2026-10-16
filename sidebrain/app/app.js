@@ -70,7 +70,6 @@ async function start() {
   bind();
   train.mount({ sb: () => sb, user: () => user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY,
                 demo: DEMO, keep, load, rerender: () => render() });
-  train.bindSubmit();
   setInterval(tickClock, 60000);
   if (DEMO) {
     user = { email: "Demo" };
