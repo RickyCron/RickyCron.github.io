@@ -303,3 +303,35 @@ export function ago(then, now = Date.now()) {
   if (mins < 60) return `${mins} min ago`;
   return localDay(then) === localDay(now) ? "at " + clock(new Date(then)) : "on " + shortDay(localDay(then));
 }
+
+// ---------- The class on now (the Capture tab files a note under it; NexiJev.classNow on the Mac) ----------
+
+const plainName = (s) => String(s ?? "").toLowerCase().replaceAll("&", " and ").split(/[^\p{L}\p{N}]+/u).filter(Boolean).join(" ");
+
+/** The class on now, as {module, lecture, label} ("BES L3"), or null: a lecture, seminar or workshop event (or one with a
+ *  module code) from 15 minutes before it starts to its end, whose title names a module by full name, code or short name
+ *  (TodayModel.lecture). The lecture is the module's one that day, else the one whose L/S number is in the title; the class
+ *  already running wins over the next one. */
+export function classNow(events, modules, lectures, now = new Date()) {
+  const wait = (start) => (start <= now ? now - start : 1e12 + (start - now));
+  const on = events.map((e) => ({ e, title: text(e.data, "title") ?? e.title ?? "", start: instant(e.data?.start), end: instant(e.data?.end) }))
+    .filter(({ e, title, start, end }) => start && !gone(e) && e.data?.allDay !== true && (/lecture|seminar|workshop/i.test(title) || text(e.data, "code"))
+      && start - 15 * 6e4 <= now && now <= (end ?? new Date(start.getTime() + 36e5)))
+    .sort((a, b) => wait(a.start) - wait(b.start));
+  for (const { e, title, start } of on) {
+    const words = title.toUpperCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean), code = text(e.data, "code")?.toUpperCase();
+    const mod = modules.find((m) => {
+      const name = m.module ?? m.title ?? "";
+      return (code && text(m.data, "code")?.toUpperCase() === code) || (name && plainName(title).includes(plainName(name)))
+        || [text(m.data, "code"), text(m.data, "short")].some((x) => x && words.includes(x.toUpperCase()));
+    });
+    if (!mod) continue;
+    const module = mod.module ?? mod.title, day = localDay(start), own = lectures.filter((l) => l.module === module);
+    const said = title.match(/(lecture|session|seminar)\s*(\d+)/i);
+    const number = words.find((w) => /^[LS]\d+$/.test(w)) ?? (said ? (/^(session|seminar)$/i.test(said[1]) ? "S" : "L") + said[2] : null);
+    const lec = own.find((l) => String(l.date ?? "").slice(0, 10) === day && l.data?.dated !== "posted") ?? own.find((l) => number && text(l.data, "n")?.toUpperCase() === number);
+    const n = text(lec?.data, "n");
+    return { module, lecture: n, label: [text(mod.data, "short") ?? module, n].filter(Boolean).join(" ") };
+  }
+  return null;
+}

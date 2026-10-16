@@ -1,7 +1,7 @@
 // Lecture notes on the phone. A small Markdown renderer for `note` bodies (the subset uni-lectures writes, split the
 // way Sources/(C) StudyModel.swift `blocks` does and drawn like MarkdownView in Sources/(C) Glass.swift), and the
 // structured lecture doc in `data.doc` (docs/(C) Lecture doc format.md; Sources/(C) LectureDoc.swift and
-// Sources/(C) View LectureDoc.swift). All text is HTML-escaped first; only http(s) and mailto links become links.
+// Sources/(C) View LectureDoc.swift). All text is HTML-escaped first; only http(s), mailto and note: links become links.
 // Pure functions, no DOM: checked by node --test web/notes.test.mjs.
 import { prep } from "./today.js";
 
@@ -12,7 +12,8 @@ const str = (x) => (typeof x === "string" ? x : "");
 const arr = (x) => (Array.isArray(x) ? x : []);
 const WIKI = [[/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2"], [/\[\[([^\]]+)\]\]/g, "$1"]];
 
-/** Inline Markdown as HTML: **bold**, *italic*, `code`, [text](https://…); [[wiki|links]] show their name. */
+/** Inline Markdown as HTML: **bold**, *italic*, `code`, [text](https://…); [[wiki|links]] show their name. A `note:<id>`
+ *  link (a module map's classes) opens that note in the app; its href is the app's own ?open= link. */
 export function inline(s) {
   const kept = [], stash = (html) => `\u0000${kept.push(html) - 1}\u0000`;
   let t = String(s ?? "").replace(/\u0000/g, "");
@@ -20,7 +21,8 @@ export function inline(s) {
   t = esc(t)
     .replace(/`([^`]+)`/g, (_, code) => stash(`<code>${code}</code>`))
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, url) =>
-      /^(https?:\/\/|mailto:)/i.test(url) ? stash(`<a href="${url}" target="_blank" rel="noopener noreferrer">`) + label + stash("</a>") : label)
+      /^(https?:\/\/|mailto:)/i.test(url) ? stash(`<a href="${url}" target="_blank" rel="noopener noreferrer">`) + label + stash("</a>")
+      : /^note:[\w.-]+$/.test(url) ? stash(`<a href="?open=${url}" data-note="${url.slice(5)}">`) + label + stash("</a>") : label)
     .replace(/(\*\*|__)(\S|\S.*?\S)\1/g, "<strong>$2</strong>")
     .replace(/(^|[^\w*])\*(\S|\S[^*]*?\S)\*(?![\w*])/g, "$1<em>$2</em>")
     .replace(/(^|\W)_(\S|\S[^_]*?\S)_(?!\w)/g, "$1<em>$2</em>");
@@ -318,17 +320,28 @@ function diagram(d, caption, i, state, step = null) {
 
 // ---------- Which notes belong to a lecture (Sources/(C) View Study.swift LectureReader) ----------
 
-/** A lecture's primer and full notes: data.pre and data.post, else the notes built in the app (user_data.builtPost). */
+/** Notes built from the slides alone: the app's say so in data.from, the uni-lectures job's in the title or first line
+ *  ("From slides, no recording"), as StudyModel.fromSlides reads them. */
+export const fromSlides = (n) => n?.data?.from === "slides" || /from slides/i.test(n?.title ?? "") || /^[\s*_#>]*from (the )?slides/i.test(n?.data?.body ?? "");
+
+/** A lecture's primer and full notes. The full notes in Ricky's order (StudyModel.post): data.post (the job's) or
+ *  user_data.builtPost (built in the app), the first from the recording, else the first there is. */
 export function lectureNotes(lecture, byId) {
   const get = (id) => (typeof id === "string" && byId.get(id)) || null;
-  return { pre: get(lecture.data?.pre), post: get(lecture.data?.post) ?? get(lecture.user_data?.builtPost) };
+  const posts = [get(lecture.data?.post), get(lecture.user_data?.builtPost)].filter(Boolean);
+  return { pre: get(lecture.data?.pre), post: posts.find((n) => !fromSlides(n)) ?? posts[0] ?? null };
 }
 
 /** "L2" → 2, "S10" → 10. */
 const number = (n) => Number(String(n ?? "").replace(/\D/g, "")) || 0;
-/** Newest first: higher lecture number, then later date (StudyModel.ordered). */
-export const ordered = (lectures) => [...lectures].sort((a, b) =>
-  number(b.data?.n) - number(a.data?.n) || ((b.date ?? "") > (a.date ?? "") ? 1 : (b.date ?? "") < (a.date ?? "") ? -1 : 0));
+const label = (l) => String(l.data?.n ?? "").toUpperCase();
+/** Newest first: higher lecture number, then later date. A lecture the app started (a moodle row) that the job now lists
+ *  too shows once, as the job's row (StudyModel.ordered). */
+export const ordered = (lectures) => {
+  const jobs = new Set(lectures.filter((l) => l.source !== "moodle" && l.data?.n).map(label));
+  return lectures.filter((l) => l.source !== "moodle" || !jobs.has(label(l))).sort((a, b) =>
+    number(b.data?.n) - number(a.data?.n) || ((b.date ?? "") > (a.date ?? "") ? 1 : (b.date ?? "") < (a.date ?? "") ? -1 : 0));
+};
 /** A lecture's own day, null when it is only the day its slides went up (data.dated "posted"), so that day is never shown
  *  or taken for the next lecture (StudyModel.lectureDay). */
 export const lectureDay = (l) => (l?.data?.dated === "posted" ? null : l?.date ?? null);

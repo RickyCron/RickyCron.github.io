@@ -5,8 +5,9 @@
 // Writes go through a small outbox in localStorage, so a review on a train with no signal is never lost.
 import { schedule, intervalLabel, due, nextDue, examDays, todayString, daysBetween, addDays } from "./sm2.js";
 import { withoutGreeting, dueSoon, dueLabel, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS,
-         upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock } from "./today.js";
+         upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock, classNow } from "./today.js";
 import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay, TICK } from "./notes.js";
+import * as train from "./train.js";
 
 // ---- Settings to fill in before publishing (web/(C) README.md) ----
 const SUPABASE_URL = "https://rdwavprncthvujmckige.supabase.co";
@@ -40,6 +41,8 @@ let thumbs = new Map();              // photo path → signed URL (or a data URL
 let outbox = load("outbox", []);     // [{t: "review" | "tick" | "edit" | "attempt", id, user_data, activity?} | {t: "note" | "add", row}], oldest first
 let captures = load("captures", []); // the last captures made on this phone: {id, body, photo, thumb?, at}
 let synced = load("synced", 0), tried = 0;
+// The Train plugin (train.js): off until switched on in the Account sheet, per phone. Off, no `gym` row is fetched.
+let trainOn = load("train", false);
 let tab = "today", reviewing = false, loaded = false, cloud = "", syncError = "", signedOutOfSync = false, reminders = "off";
 const photos = { capture: null, add: null }; // the photo waiting in each composer
 // Today's view state.
@@ -65,6 +68,9 @@ async function start() {
   if (!("switch" in HTMLInputElement.prototype)) document.documentElement.classList.add("noswitch");
   for (const form of document.querySelectorAll("form.compose")) form.innerHTML = composer();
   bind();
+  train.mount({ sb: () => sb, user: () => user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY,
+                demo: DEMO, keep, load, rerender: () => render() });
+  train.bindSubmit();
   setInterval(tickClock, 60000);
   if (DEMO) {
     user = { email: "Demo" };
@@ -148,6 +154,8 @@ async function refresh() {
       // ponytail: the last 30 days of pings; page further back if the Inbox ever needs older ones.
       run(items("ping", "id,title,date,data,user_data,updated_at").gte("date", addDays(today, -30)).lte("date", addDays(today, 7))),
     ]);
+    // Off the critical path: before the gym migration is applied the query fails, and Today must still load.
+    if (trainOn) all("gym", "id,kind,source,date,title,data,user_data,created_at,updated_at,deleted_at").then(train.setRows, () => {});
     const fresh = { cards: c, assessments: a, tasks: t, applications: ap, events: ev, brief: b[0] ?? null, notes: n, modules: mo, lectures: le, practice: pr, pings: pg };
     // Lecture notes are the bulk (~25 KB each with their doc), so they get their own key: if they ever outgrow
     // localStorage, only offline reading is lost, never the cards and the outbox.
@@ -187,7 +195,7 @@ function merge(fetched = [], local = []) {
 function useData(d) {
   const pending = new Map(outbox.filter((o) => o.user_data).map((o) => [o.id, o.user_data]));
   const withPending = (list = []) => list.map((x) => (pending.has(x.id) ? { ...x, user_data: pending.get(x.id) } : x));
-  const added = outbox.filter((o) => o.t === "add").map((o) => ({ ...o.row, created_at: o.at }));
+  const added = outbox.filter((o) => o.t === "add" && o.row.kind === "task").map((o) => ({ ...o.row, created_at: o.at }));
   cards = withPending(merge(d.cards, cards));
   byId = new Map(cards.map((x) => [x.id, x]));
   tasks = withPending(merge([...(d.tasks ?? []).filter((x) => !added.some((a) => a.id === x.id)), ...added], tasks));
@@ -324,6 +332,13 @@ function attempt(id) {
   render();
 }
 
+/** A new row from a plugin (train.js): queued like a to-do, but kept out of Today's tasks. */
+function addRow(row) {
+  outbox.push({ t: "gym", row, at: new Date().toISOString() });
+  keep("outbox", outbox);
+  flush();
+}
+
 // ---------- Sync ----------
 
 let flushing = false;
@@ -417,7 +432,8 @@ async function capture(body, file, status, cls = null) {
 async function saveCompose(form) {
   const name = form.dataset.compose, button = form.querySelector("[type=submit]"), status = form.querySelector("[role=status]");
   button.disabled = true;
-  const ok = await capture(form.elements.body.value.trim(), photos[name], status, name === "add" ? captureFor : null);
+  // In class, the Capture tab's note goes to that class's snippets on the Mac (its placeholder names the class).
+  const ok = await capture(form.elements.body.value.trim(), photos[name], status, name === "add" ? captureFor : classNow(events, modules, lectures));
   if (ok) { form.elements.body.value = ""; setPhoto(form, null); }
   canSave(form);
   if (ok && name === "add") $("add-sheet").close();
@@ -582,7 +598,7 @@ function paint(el, html) {
 
 const top = () => stack[stack.length - 1];
 
-const TABS = ["today", "study", "inbox", "capture"];
+const TABS = ["today", "study", "inbox", "capture", "train"];
 function render() {
   const signedIn = !!user, today = todayString(), root = document.documentElement;
   const pushed = signedIn && tab === "study" && stack.length > 1;
@@ -594,13 +610,16 @@ function render() {
   $("back").hidden = !pushed;
   $("account").hidden = !signedIn || pushed;
   $("account").textContent = (user?.email || "?")[0].toUpperCase();
-  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", capture: "Capture", inbox: "Inbox" }[tab];
+  if (tab === "train" && !trainOn) tab = "today";
+  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", capture: "Capture", inbox: "Inbox", train: "Train" }[tab];
+  $("tabs").querySelector('[data-tab="train"]').hidden = !trainOn;
+  $("tabs").classList.toggle("five", trainOn);
   $("tabs").style.setProperty("--i", TABS.indexOf(tab));
   for (const b of $("tabs").querySelectorAll("button")) {
     if (b.dataset.tab === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   }
   if (signedIn && loaded) navigator.setAppBadge?.(due(cards, today).length).catch(() => {});
-  if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderInbox(); renderSheet(); }
+  if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderInbox(); renderSheet(); if (trainOn) train.render(); }
   $("contents").hidden = !pushed || !screenSections.length;
   if ($("contents").hidden) setContents(false);
   watchTitle();
@@ -639,6 +658,7 @@ const ICON = {
   check: svg(`<circle cx="12" cy="12" r="8.25"/><path d="M8.5 12.25l2.4 2.4 4.6-5"/>`),
   doc: svg(`<path d="M6.75 3.25h7l4.5 4.5v11.5a1.5 1.5 0 0 1-1.5 1.5H6.75a1.5 1.5 0 0 1-1.5-1.5V4.75a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M13.25 3.25v5h5M8.75 12.5h6.5M8.75 16h6.5"/>`),
   books: svg(`<path d="M12 6.5C10.2 5.2 7.7 4.6 3.75 4.6v13c3.95 0 6.45.6 8.25 1.9 1.8-1.3 4.3-1.9 8.25-1.9v-13c-3.95 0-6.45.6-8.25 1.9zM12 6.5v13"/>`),
+  map: svg(`<path d="M3.75 6.25l5.25-2 6 2 5.25-2v13.5l-5.25 2-6-2-5.25 2zM9 4.25v13.5M15 6.25v13.5"/>`),
   list: svg(`<path d="M9 7h11M9 12h11M9 17h11M4.5 7h.01M4.5 12h.01M4.5 17h.01"/>`),
   open: svg(`<path d="M9.5 6.25h8.25v8.25M17.5 6.5L6.25 17.75"/>`),
   close: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>`,
@@ -803,7 +823,8 @@ function captureRow(c) {
 }
 
 function renderCaptures() {
-  const caps = captureList();
+  const caps = captureList(), on = classNow(events, modules, lectures);
+  $("capture").querySelector("textarea").placeholder = on ? `Note for ${on.label}` : "Note";
   paint($("capture-list"), caps.length ? `<h2 class="section">Captures</h2><ul class="group flat">${caps.map(captureRow).join("")}</ul>` : "");
 }
 
@@ -897,6 +918,7 @@ function routePending(final) {
 /** Shows a target. False when what it points at isn't here. */
 function openTarget(target) {
   const t = String(target ?? ""), at = t.indexOf(":"), kind = t.slice(0, at), id = t.slice(at + 1);
+  if (t === "train") { if (!trainOn) return false; switchTab("train"); return true; } // the rest-over push and WHOOP's return
   if (at < 1) return false;
   for (const d of document.querySelectorAll("dialog[open]")) d.close();
   reviewing = false;
@@ -957,7 +979,8 @@ const SPEEDS = [1, 1.25, 1.5, 2];
 
 // Keyed by path and script hash: the Mac re-uploads a changed script to the same path.
 const recording = (n, version) => { const p = n.user_data?.audio?.[version]; return typeof p === "string" && p ? p + "#" + (n.user_data.audio.hash ?? "") : null; };
-const script = (n, version) => { const s = n.data?.audio?.[version]?.script; return typeof s === "string" ? s.trim() : ""; };
+// A lecture note's spoken version (Listen on the Mac) is one script, kept in user_data.listen, played as "short".
+const script = (n, version) => { const s = n.data?.audio?.[version]?.script ?? (version === "short" ? n.user_data?.listen?.script : null); return typeof s === "string" ? s.trim() : ""; };
 const briefTitle = (n) => (Array.isArray(n.data?.doc?.blocks) ? n.data.doc.blocks : []).find((b) => b?.t === "h1" && b.text)?.text ?? n.title ?? "Brief";
 
 function prefetch(path) {
@@ -1242,7 +1265,8 @@ function moduleScreen(name, today) {
   // Notes no lecture points at and no lecture covers: built on the Mac from a recording that has no lecture row.
   const linked = new Set(lectures.flatMap((l) => [l.data?.pre, l.data?.post, l.user_data?.builtPost]));
   const covered = new Set(lecs.map((l) => String(l.data?.n ?? "").toUpperCase()));
-  const more = [...noteById.values()].filter((x) => x.module === name && x.data?.kind !== "readings" && !linked.has(x.id) && !covered.has(String(x.data?.lecture ?? "").toUpperCase()));
+  const more = [...noteById.values()].filter((x) => x.module === name && !["readings", "map"].includes(x.data?.kind) && !linked.has(x.id) && !covered.has(String(x.data?.lecture ?? "").toUpperCase()));
+  const map = [...noteById.values()].find((x) => x.module === name && x.data?.kind === "map"); // StudyModel.moduleMap
   const coming = lecs.filter((l) => (lectureDay(l) ?? "").slice(0, 10) >= today).sort((a, b) => (a.date < b.date ? -1 : 1))[0];
   const by = [d.convenor, d.code].filter(Boolean).join(" · ");
   const info = [...assessmentRows(d.assessment).map((a) => row({ lead: ICON.cap, title: esc(a.title), sub: esc(a.sub) })),
@@ -1252,6 +1276,7 @@ function moduleScreen(name, today) {
   if (dueHere.length) html += `<button class="btn primary mt-20" type="button" data-act="review" data-m="${esc(name)}">Review ${plural(dueHere.length, "card")}</button>`;
   else if (deck.length) html += `<p class="foot mt-12">${esc(caughtUp(nextDue(deck, today)))}</p>`;
   if (info.length) html += `<ul class="group info mt-20">${info.join("")}</ul>`;
+  if (map) html += `<ul class="group flat mt-20">${row({ tag: "button", attrs: `data-note="${esc(map.id)}"`, lead: ICON.map, title: "Module map", chev: true })}</ul>`;
   html += `<h2 class="section">Lectures</h2>` + (lecs.length ? `<ul class="group flat">${lecs.map((l) => {
     const postId = l.data?.post || l.user_data?.builtPost, fromSlides = noteById.get(postId)?.data?.from === "slides", day = lectureDay(l);
     const sub = [l.data?.n, day && dayName(day.slice(0, 10)), l.data?.pre && "Primer", postId && (fromSlides ? "Notes from slides" : "Notes")].filter(Boolean).join(" · ");
@@ -1377,6 +1402,8 @@ function renderSheet() {
     <ul class="group">
       <li><label class="row">${ICON.bell}<span class="text"><span class="title">Morning reminder</span>${note ? `<span class="subtitle${reminderError ? " warn" : ""}">${esc(note)}</span>` : ""}</span>
         <input type="checkbox" switch id="remind" ${reminders === "on" ? "checked" : ""} ${["on", "off"].includes(reminders) ? "" : "disabled"} aria-label="Morning reminder"></label></li>
+      <li><label class="row">${ICON.person}<span class="text"><span class="title">Train</span><span class="subtitle">Gym plan, logging, bodyweight and food</span></span>
+        <input type="checkbox" switch id="train-on" ${trainOn ? "checked" : ""} aria-label="Train"></label></li>
       ${DEMO ? "" : row({ lead: ICON.sync, title: "Sync", sub: signedOutOfSync && waiting ? `Sign in again to sync ${plural(waiting, "change")}` : "",
         trail: waiting ? `${waiting} waiting` : "Up to date" }).replace('class="subtitle"', 'class="subtitle warn"')}
     </ul>
@@ -1434,7 +1461,7 @@ function bind() {
     }
     if (d.module) return go({ s: "module", m: d.module });
     if (d.lecture) return go({ s: "lecture", id: d.lecture });
-    if (d.note) return go({ s: "note", id: d.note });
+    if (d.note) { e.preventDefault(); return go({ s: "note", id: d.note }); } // a map's note: link is an <a> with a real href
     if (d.practice != null) return go({ s: "practice", m: d.practice || null });
     if (d.primer) { primer.set(top().id, d.primer === "true"); render(); return scrollTo(0, 0); }
     if (d.check) return attempt(d.check);
@@ -1475,6 +1502,7 @@ function bind() {
       return;
     }
     if (el.id === "remind") return toggleReminders();
+    if (el.id === "train-on") { trainOn = el.checked; keep("train", trainOn); if (trainOn) refresh(); return render(); }
     if (el.name === "photo") return el.files?.[0] && setPhoto(el.closest("form"), el.files[0]);
   });
   document.addEventListener("submit", (e) => {
