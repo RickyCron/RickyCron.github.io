@@ -4,8 +4,8 @@
 // write is merged into the row's user_data and carries `userAt`, so the server can keep the newer one.
 // Writes go through a small outbox in localStorage, so a review on a train with no signal is never lost.
 import { schedule, intervalLabel, due, nextDue, examDays, todayString, daysBetween, addDays } from "./sm2.js";
-import { withoutGreeting, dueSoon, dueLabel, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS,
-         upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock, classNow } from "./today.js";
+import { withoutGreeting, dueSoon, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS, effectiveDate,
+         upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock, classNow, heroEvent, heroFigure, weekEnd, prep } from "./today.js";
 import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay, TICK } from "./notes.js";
 import * as train from "./train.js";
 
@@ -21,7 +21,8 @@ const SUPABASE_JS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/
 
 const DEMO_MODE = new URLSearchParams(location.search).get("demo");
 const DEMO = DEMO_MODE === "1" || DEMO_MODE === "empty"; // ?demo=empty: a new friend's account, nothing in it yet
-const NAMES = ["Again", "Hard", "Good", "Easy"];
+const CAP = 20; // cards per review session: a small daily dose with a real end
+const num = (n) => new Intl.NumberFormat("en-GB").format(n);
 const FRESH = 5 * 60000; // refresh every 5 minutes while the app is open
 const $ = (id) => document.getElementById(id);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -44,11 +45,10 @@ let synced = load("synced", 0), tried = 0;
 // The Train plugin (train.js): off until switched on in the Account sheet, per phone. Off, no `gym` row is fetched.
 let trainOn = load("train", false);
 let tab = "today", reviewing = false, loaded = false, cloud = "", syncError = "", signedOutOfSync = false, reminders = "off";
-const photos = { capture: null, add: null }; // the photo waiting in each composer
+const photos = { add: null }; // the photo waiting in the composer
 // Today's view state.
 const held = new Map();     // task id → {kind: "done" | "gone", at, timer}: shown (ticked or leaving) until it collapses
-const datesShown = new Set(); // coursework ids showing their date instead of the countdown
-let openSlipped = false, openEarlier = false, allDue = false, allEvents = false, allNext = false, sheetTask = null, sheetPing = null;
+let sheetTask = null, sheetPing = null;
 let addMode = "todo", todoIgnore = new Set(), todoParse = null, todoManual = null;
 const session = { queue: [], index: 0, flipped: false, grades: [0, 0, 0, 0], day: "", module: null, lecture: null };
 // Study screens, pushed and popped inside the tab like the Mac's StudyView: {s: "home" | "module" | "lecture" | "note" |
@@ -69,7 +69,9 @@ async function start() {
   for (const form of document.querySelectorAll("form.compose")) form.innerHTML = composer();
   bind();
   train.mount({ sb: () => sb, user: () => user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY,
-                demo: DEMO, keep, load, rerender: () => render(), tab: () => switchTab("train") });
+                demo: DEMO, keep, load, rerender: () => render(), tab: () => switchTab("train"),
+                // Train builds on the shell's components (Design system.md): its sheet, the Undo toast, the confirm and folds.
+                openSheet, closeSheet, sheetGestures, toast, ask, fold, on: () => trainOn });
   setInterval(tickClock, 60000);
   if (DEMO) {
     user = { email: "Demo" };
@@ -228,7 +230,7 @@ const dueFor = (module = null, lecture = null) =>
   due(cards.filter((c) => (!module || c.module === module) && (!lecture || c.data?.lecture === lecture)), todayString());
 
 function newSession(module = session.module, lecture = session.lecture) {
-  Object.assign(session, { queue: dueFor(module, lecture).map((x) => x.id), index: 0, flipped: false, grades: [0, 0, 0, 0], day: todayString(), module, lecture });
+  Object.assign(session, { queue: dueFor(module, lecture).slice(0, CAP).map((x) => x.id), index: 0, flipped: false, grades: [0, 0, 0, 0], day: todayString(), module, lecture });
 }
 
 const current = () => byId.get(session.queue[session.index]);
@@ -246,7 +248,7 @@ function grade(g) {
   const today = todayString(), now = Date.now();
   const next = schedule(card.user_data ?? {}, g, examFor(card), today, now);
   writeUser(card, next, "review", activity(card.id, "review", now, { grade: g, interval: next.interval, ease: next.ease }));
-  session.grades[g] += 1;
+  if (!session.queue.slice(0, session.index).includes(card.id)) session.grades[g] += 1; // each card's first grade: "7 cards · 5 Good · 2 Again"
   if (g === 0) session.queue.push(card.id); // Again is due today, so it comes round once more this session
   session.index += 1; session.flipped = false;
   render();
@@ -271,7 +273,7 @@ function tick(id) {
 
 /** The row folds away (height over 300 ms), then the list redraws without it. */
 function collapse(id) {
-  const li = $("today").querySelector(`[data-row="${CSS.escape(id)}"]`);
+  const li = document.querySelector(`#day [data-row="${CSS.escape(id)}"]`);
   const finish = () => { held.delete(id); render(); };
   if (!li || still()) return finish();
   li.style.height = li.offsetHeight + "px";
@@ -281,29 +283,29 @@ function collapse(id) {
   setTimeout(finish, 300);
 }
 
+/** A task leaves its place (moved or let go): the row shows as it was, folds away, and a toast offers Undo, which writes
+ *  `undo` back. */
+function leave(task, prev, patch, message, undo) {
+  writeUser(task, patch, "edit");
+  closeSheet($("task-sheet"));
+  held.set(task.id, { kind: "moved", at: Date.now(), prev });
+  render();
+  requestAnimationFrame(() => collapse(task.id));
+  toast(message, () => { held.delete(task.id); writeUser(task, undo, "edit"); render(); });
+}
+
 /** Reschedule: user_data.doDate, which wins over the row's own date (R1). */
 function move(id, day) {
   const task = tasks.find((x) => x.id === id), today = todayString();
   if (!task || !day || day < today) return; // a picker that lets a past day through (min isn't enforced everywhere)
   const prev = task.user_data ?? {};
-  writeUser(task, { doDate: day }, "edit");
-  $("task-sheet").close();
-  if (daysBetween(today, day) > 7) { // off Due soon: the row says where it went, then folds away
-    held.set(id, { kind: "moved", at: Date.now(), prev, note: `Moved to ${dayName(day, today)}` });
-    setTimeout(() => collapse(id), 1800);
-  }
-  render();
+  leave(task, prev, { doDate: day }, `Moved to ${dayName(day, today).replace(/^(Today|Tomorrow)$/, (w) => w.toLowerCase())}`, { doDate: prev.doDate ?? null });
 }
 
-/** Let go: {dismissed: true}; the row folds away. */
+/** Let go: {dismissed: true}. */
 function letGo(id) {
   const task = tasks.find((x) => x.id === id);
-  if (!task) return;
-  writeUser(task, { dismissed: true }, "edit");
-  held.set(id, { kind: "gone", at: Date.now() });
-  $("task-sheet").close();
-  render();
-  requestAnimationFrame(() => collapse(id));
+  if (task) leave(task, task.user_data ?? {}, { dismissed: true }, "Let go", { dismissed: false });
 }
 
 /** A new to-do: the row the Mac's quick add writes (Store.addOwn: kind task, source you, data {title, origin: "You"}). */
@@ -431,11 +433,11 @@ async function capture(body, file, status, cls = null) {
 async function saveCompose(form) {
   const name = form.dataset.compose, button = form.querySelector("[type=submit]"), status = form.querySelector("[role=status]");
   button.disabled = true;
-  // In class, the Capture tab's note goes to that class's snippets on the Mac (its placeholder names the class).
-  const ok = await capture(form.elements.body.value.trim(), photos[name], status, name === "add" ? captureFor : classNow(events, modules, lectures));
+  // In class, the note goes to that class's snippets on the Mac (the placeholder names the class); "Note for this class" picks one.
+  const ok = await capture(form.elements.body.value.trim(), photos[name], status, captureFor ?? classNow(events, modules, lectures));
   if (ok) { form.elements.body.value = ""; setPhoto(form, null); }
   canSave(form);
-  if (ok && name === "add") $("add-sheet").close();
+  if (ok) closeSheet($("add-sheet"));
 }
 
 /** Thumbnails for synced captures with a photo that this phone has no copy of (another phone, or after a sign-out). */
@@ -552,7 +554,7 @@ async function showSignIn() {
       say("signin-status", error ? `Sign-in failed: ${error.message}` : "", !!error);
     },
   });
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const dark = theme() === "dark" || (theme() === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
   // GIS has no supported way to start this ID-token flow from a custom button, so this is its own button, as wide as it goes.
   google.accounts.id.renderButton($("gsi"), { theme: dark ? "filled_black" : "outline", size: "large", shape: "pill", text: "continue_with", logo_alignment: "left",
     width: Math.min(400, Math.round($("gsi").getBoundingClientRect().width) || 358) });
@@ -569,10 +571,9 @@ async function signOut() {
     for (const k of ["outbox", "captures", "reminders"]) localStorage.removeItem(PREFIX + k);
     return location.reload();
   }
-  if (outbox.length && !confirm(`${plural(outbox.length, "change")} ${outbox.length === 1 ? "hasn’t" : "haven’t"} synced yet and will be lost. Sign out anyway?`)) return;
   for (const k of ["outbox", "captures", "cache", "user", "synced"]) localStorage.removeItem(PREFIX + k);
   outbox = []; captures = [];
-  $("sheet").close();
+  closeSheet($("sheet"));
   navigator.clearAppBadge?.().catch(() => {});
   // Local scope: supabase-js defaults to "global", which revoked the Macs' sessions too (7 Oct, sync stopped on both).
   await sb?.auth.signOut({ scope: "local" });
@@ -597,30 +598,39 @@ function paint(el, html) {
 
 const top = () => stack[stack.length - 1];
 
-const TABS = ["today", "study", "inbox", "capture", "train"];
+const TABS = ["today", "study", "inbox", "train"];
 function render() {
   const signedIn = !!user, today = todayString(), root = document.documentElement;
   const pushed = signedIn && tab === "study" && stack.length > 1;
   root.classList.toggle("reviewing", signedIn && reviewing);
   $("signin").hidden = signedIn;
   $("dock").hidden = !signedIn;
+  if (tab === "train" && !trainOn) tab = "today"; // before the pages show, so turning Train off on its own tab lands on Today
   for (const t of TABS) $(t).hidden = !signedIn || tab !== t;
   $("review").hidden = !(signedIn && reviewing);
   $("back").hidden = !pushed;
   $("account").hidden = !signedIn || pushed;
   $("account").textContent = (user?.email || "?")[0].toUpperCase();
-  if (tab === "train" && !trainOn) tab = "today";
-  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", capture: "Capture", inbox: "Inbox", train: "Train" }[tab];
+  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", inbox: "Inbox", train: "Train" }[tab];
   $("tabs").querySelector('[data-tab="train"]').hidden = !trainOn;
-  $("tabs").classList.toggle("five", trainOn);
+  $("tabs").style.setProperty("--n", trainOn ? 4 : 3);
   $("tabs").style.setProperty("--i", TABS.indexOf(tab));
   for (const b of $("tabs").querySelectorAll("button")) {
     if (b.dataset.tab === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   }
   if (signedIn && loaded) navigator.setAppBadge?.(due(cards, today).length).catch(() => {});
+  $("read-all").hidden = true; // renderInbox shows it on the Inbox while something is unread
   if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderInbox(); renderSheet(); if (trainOn) train.render(); }
+  // The day sheet lives on Today only, under the hero; the tab bar's scroll edge then fades into the sheet's colour.
+  const day = signedIn && tab === "today" && !reviewing && todaySheet;
+  $("day").hidden = $("scrim").hidden = !day;
+  root.classList.toggle("on-today", day);
+  if (day) daySheet.layout(); else daySheet.focusable();
   $("contents").hidden = !pushed || !screenSections.length;
-  if ($("contents").hidden) setContents(false);
+  $("more").hidden = !pushed || !screenMore;
+  root.classList.toggle("pushed", pushed);
+  if ($("contents").hidden && menuFor === "contents" || $("more").hidden && menuFor === "more") setMenu(null, true);
+  updateSection();
   watchTitle();
 }
 
@@ -660,6 +670,13 @@ const ICON = {
   map: svg(`<path d="M3.75 6.25l5.25-2 6 2 5.25-2v13.5l-5.25 2-6-2-5.25 2zM9 4.25v13.5M15 6.25v13.5"/>`),
   list: svg(`<path d="M9 7h11M9 12h11M9 17h11M4.5 7h.01M4.5 12h.01M4.5 17h.01"/>`),
   open: svg(`<path d="M9.5 6.25h8.25v8.25M17.5 6.5L6.25 17.75"/>`),
+  cards: svg(`<rect x="3.75" y="7.25" width="13.5" height="12.5" rx="2.25"/><path d="M7.25 4.25h10.75a2.25 2.25 0 0 1 2.25 2.25v9.75"/>`),
+  note: svg(`<path d="M5.25 4.75h13.5v9.5l-4.5 4.5h-9z"/><path d="M14.25 18.75v-4.5h4.5M8.5 9h7M8.5 12.5h4"/>`),
+  pin: svg(`<path d="M12 21s-6.25-5.4-6.25-10.5a6.25 6.25 0 0 1 12.5 0C18.25 15.6 12 21 12 21z"/><circle cx="12" cy="10.5" r="2.25"/>`),
+  contrast: svg(`<circle cx="12" cy="12" r="8.25"/><path d="M12 3.75a8.25 8.25 0 0 1 0 16.5z" fill="currentColor" stroke="none"/>`),
+  tray: svg(`<path d="M3.75 13.25l2.6-7.1a1.5 1.5 0 0 1 1.4-.9h8.5a1.5 1.5 0 0 1 1.4.9l2.6 7.1v4.5a1.5 1.5 0 0 1-1.5 1.5H5.25a1.5 1.5 0 0 1-1.5-1.5zM3.75 13.25H8.5l1 2h5l1-2h4.75"/>`),
+  dumbbell: svg(`<path d="M3.25 9.5v5M6.25 7v10M17.75 7v10M20.75 9.5v5M6.25 12h11.5"/>`),
+  tickMark: `<svg class="check-glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12.5l4.25 4.25L18.5 7.5"/></svg>`,
   close: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>`,
   more: `<svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.1"/><circle cx="12" cy="12" r="1.1"/><circle cx="18" cy="12" r="1.1"/></svg>`,
   play: `<svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M8 5.5v13l10.5-6.5z"/></svg>`,
@@ -671,7 +688,7 @@ function row({ tag = "div", attrs = "", lead = "", title, sub = "", trail = "", 
   const type = tag === "button" ? ` type="button"` : "";
   return `<li><${tag} class="row${cls ? " " + cls : ""}"${type} ${attrs}>${lead}<span class="text"><span class="title${titleCls ? " " + titleCls : ""}">${title}</span>${sub ? `<span class="subtitle">${sub}</span>` : ""}</span>${trail !== "" ? `<span class="trail${trailCls ? " " + trailCls : ""}">${trail}</span>` : ""}${chev ? ICON.chev : ""}</${tag}></li>`;
 }
-const head = (title, sub = "") => `<h1 class="large">${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}`;
+const head = (title, sub = "") => `<h1 class="large${String(title).length > 60 ? " long" : ""}">${esc(title)}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}`;
 const empty = (icon, title, line, action = "") => `<div class="empty">${icon.replace('class="glyph"', "")}<h2 class="section-title">${esc(title)}</h2>${line ? `<p>${esc(line)}</p>` : ""}${action}</div>`;
 const SKELETON = `<div class="skeleton" aria-hidden="true"><i></i><i></i><i></i><i></i></div>`;
 const longDate = () => new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
@@ -684,28 +701,23 @@ function when(ms) {
   return n > 1 && n <= 6 ? WEEKDAYS[d.getDay()] : `${d.getDate()} ${MONTHS[d.getMonth()]}`;
 }
 const localDay = (ms) => todayString(new Date(ms));
-const countdown = (days) => (days < 14 ? `${days} days` : `${Math.floor(days / 7)} wk`);
 const dayName = (day, today = todayString()) => (day === today ? "Today" : day === addDays(today, 1) ? "Tomorrow" : shortDay(day) + (day.slice(0, 4) !== today.slice(0, 4) ? " " + day.slice(0, 4) : ""));
 const nextMonday = (today) => parseWhen("next week", today).date;
 const norm = (t) => String(t ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 const notices = () => [syncError && `<p class="foot warn">${esc(syncError)}</p>`, routeNote && `<p class="foot warn">${esc(routeNote)}</p>`, cloud && `<p class="foot">${esc(cloud)}</p>`].filter(Boolean).join("");
-/** Due soon's trailing value: "17:30" or "Today", "Tomorrow", the weekday 2 to 6 days out ("Fri"), then "Wed 14 Oct". */
-function dueText(r) {
-  if (r.slipped) return shortDay(r.date);
-  if (r.days === 0 && r.time) return r.time;
-  if (r.days >= 2 && r.days <= 6) return WEEKDAYS[new Date(r.date.slice(0, 10) + "T12:00").getDay()];
-  return dueLabel(r);
-}
 
-// ---------- Today ----------
+// ---------- Today: the hero ("what now?"), the priority line, and the rest of the day in the day sheet ----------
+
+let todaySheet = false; // the day sheet shows only when Today has content (not while loading, not on the empty state)
 
 function renderToday(today) {
   const top = head("Today", longDate()) + notices();
+  todaySheet = false;
   if (!loaded) return paint($("today"), top + SKELETON);
-  const now = Date.now();
-  const sched = daySchedule(events, new Date(now), 3, allEvents);
+  const now = Date.now(), at = new Date(now);
+  const sched = daySchedule(events, at, 0, true);
   const p = brief?.date?.slice(0, 10) === today && typeof brief.data?.priority?.title === "string" && brief.data.priority.title ? brief.data.priority : null; // only today's brief, as on the Mac
-  // The priority, when it is one of the tasks, gets that task's tick, and the task leaves Due soon.
+  // The priority, when it is one of the tasks, gets that task's tick, and the task leaves To do.
   const pTask = p && tasks.find((t) => !t.user_data?.dismissed && norm(t.data?.title ?? t.title) === norm(p.title));
   const cardsDue = due(cards, today).length;
   // Held rows (just ticked, or leaving) stay in the list until they fold away.
@@ -714,80 +726,128 @@ function renderToday(today) {
   // ...and so does a deadline of the priority's module on the priority's due day ("Outline to tutor" under "Outline the CRG essay").
   const pModules = !p ? [] : [p.module, ...modules.filter((m) => [m.data?.short, moduleName(m)].some((n) => n && new RegExp(`(^|\\W)${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\W|$)`, "i").test(p.title))).map(moduleName)].filter(Boolean);
   const pDay = typeof p?.due === "string" ? p.due.slice(0, 10) : null;
-  const rows = dueSoon(list, assessments, applications, today).filter((r) => r.id !== pTask?.id && !(p && !pTask && norm(r.title) === norm(p.title))
-    && !((r.kind === "assessment" || r.kind === "milestone") && r.date === pDay && pModules.includes(r.module)));
-  const slipped = rows.filter((r) => r.slipped), soon = rows.filter((r) => !r.slipped);
+  const all = dueSoon(list, assessments, applications, today), swallowed = (r) => r.id === pTask?.id || (p && !pTask && norm(r.title) === norm(p.title))
+    || ((r.kind === "assessment" || r.kind === "milestone") && r.date === pDay && pModules.includes(r.module));
+  const rows = all.filter((r) => !swallowed(r));
+  // What the priority stands for, so a ping's item: link finds it there (a milestone answers to its assessment's id).
+  const pItems = [pTask?.id, ...all.filter(swallowed).map((r) => itemId(r.id))].filter(Boolean);
+  const slipped = rows.filter((r) => r.slipped), toDo = rows.filter((r) => !r.slipped && (r.days == null || r.days === 0));
+  const lastDay = localDay(weekEnd(at).getTime());
+  const weekDue = rows.filter((r) => r.days >= 1 && r.date.slice(0, 10) <= lastDay);
   const later = runway(assessments.filter((a) => !gone(a)), today);
-  const caps = captureList();
-  const hasSchedule = sched.allDay.length || sched.past.length || sched.now.length || sched.next.length;
-  const foot = `<p class="foot mt-28" id="today-foot"></p>`;
-  // Up next, now to Sunday. Today's classes are already in Schedule, so they aren't repeated here.
-  const ahead = upNext({ events, pings, tasks, assessments, notes: [...noteById.values()] }, new Date(now)).filter((r) => !(r.event && r.day === today && hasSchedule));
-  const briefAt = new Map([...noteById.values()].filter((n) => n.data?.kind === "pre" && Date.parse(n.data?.classAt)).map((n) => [Date.parse(n.data.classAt), n]));
+  const hero = heroEvent(events, at);
+  const hasDay = sched.allDay.length || sched.past.length || sched.now.length || sched.next.length;
+  const foot = `<p class="${hasDay || rows.length || cardsDue ? "day-foot" : "foot mt-28"}" id="today-foot"></p>`;
 
-  if (!hasSchedule && !ahead.length && !p && !cardsDue && !rows.length && !later.length && !caps.length) {
-    paint($("today"), top + empty(ICON.sun, "Nothing due", "Deadlines, lectures and to-dos from the Mac show up here.",
-      `<button class="btn secondary" type="button" data-act="add">Add a to-do</button>`).replace('class="empty"', 'class="empty fill"') + foot);
+  if (!hero && !hasDay && !p && !cardsDue && !rows.length && !later.length) {
+    paint($("today"), top + empty(ICON.sun, "Nothing due", "Deadlines, classes and to-dos show up here.",
+      `<button class="btn secondary" type="button" data-act="add">Add a to-do</button>${foot}`).replace('class="empty"', 'class="empty fill"'));
     return updateFoot();
   }
+  todaySheet = true;
+  const briefAt = new Map([...noteById.values()].filter((n) => n.data?.kind === "pre" && Date.parse(n.data?.classAt)).map((n) => [Date.parse(n.data.classAt), n]));
+  paint($("today"), top + heroHtml(hero, briefAt, at) + prioHtml(p, pTask, today, now, pItems));
 
-  let html = top;
-  if (hasSchedule) {
-    const time = (t) => `<span class="time">${t}</span>`;
-    const event = (e, trail = "") => { const b = briefAt.get(e.start.getTime());
-      return row({ tag: b ? "button" : "div", attrs: `data-item="${esc(e.id)}"${b ? ` data-open="note:${esc(b.id)}"` : ""}`, lead: time(e.time), title: esc(e.title),
-        sub: esc([b && briefLabel(b), e.location].filter(Boolean).join(" · ")), trail, cls: e.state === "past" ? "past" : "", chev: !!b }); };
-    html += `<h2 class="section">Schedule</h2><ul class="group times">
-      ${sched.allDay.length ? row({ lead: time("All day"), title: esc(sched.allDay.join(", ")), titleCls: "one" }) : ""}
-      ${sched.past.length ? row({ tag: "button", attrs: `data-act="earlier" aria-expanded="${openEarlier}"`, lead: time(""), title: `${sched.past.length} earlier`, cls: "fold", chev: true }) : ""}
-      ${openEarlier ? sched.past.map((e) => event(e)).join("") : ""}
-      ${sched.now.map((e) => event(e, "Now")).join("")}
-      ${sched.next.map((e) => event(e)).join("")}
-      ${!sched.now.length && !sched.next.length ? row({ lead: time(""), title: "Nothing else today", cls: "quiet" }) : ""}
-      ${sched.more ? row({ tag: "button", attrs: `data-act="all-events"`, title: allEvents ? "Show less" : "Show all", cls: "more" }) : ""}
-    </ul>`;
-  }
-  if (ahead.length) {
-    const label = (r) => (r.day === today ? "Today" : r.day === addDays(today, 1) ? "Tomorrow" : WEEKDAYS[new Date(r.day + "T12:00").getDay()]);
-    html += `<h2 class="section">Up next</h2><ul class="group times">${(allNext ? ahead : ahead.slice(0, 5)).map((r) => row({
-      tag: r.open ? "button" : "div", attrs: `data-next="${esc(r.id)}"${r.open ? ` data-open="${esc(r.open)}"` : ""}`,
-      lead: `<span class="time">${r.time ?? (r.kind === "assessment" ? "Due" : "All day")}</span>`, title: esc(r.title), titleCls: "clamp",
-      sub: esc(shorten(r.sub)), trail: label(r), chev: !!r.open })).join("")}
-      ${ahead.length > 5 ? row({ tag: "button", attrs: `data-act="all-next"`, title: allNext ? "Show less" : "Show all", cls: "more" }) : ""}</ul>`;
-  }
-  if (p) {
-    const why = typeof p.why === "string" ? withoutGreeting(p.why) : "";
-    const pd = typeof p.due === "string" && /^\d{4}-\d{2}-\d{2}/.test(p.due) ? { date: p.due, days: daysBetween(today, p.due.slice(0, 10)) } : null;
-    const h = pTask && held.get(pTask.id), done = !!pTask && (h?.kind === "done" || pTask.user_data?.done === true);
-    const text = `<span class="text"><span class="title strong">${esc(p.title)}</span>${why ? `<span class="why">${esc(why)}</span>` : ""}
-      ${pd ? `<span class="subtitle${pd.days < 0 && !done ? " warn" : ""}">${esc(priorityDueLabel(pd))}</span>` : ""}</span>`;
-    html += `<h2 class="section">Top priority</h2><div class="group">${pTask
-      ? `<div class="task prio${done ? " done" : ""}${h && now - h.at < 450 ? " just" : ""}">${tickButton(pTask.id, p.title, done)}<div class="row block">${text}</div></div>`
-      : `<div class="row block">${text}</div>`}</div>`;
-  }
+  // The day sheet: To do (today and undated, at most five, More and Slipped folded), then one timeline.
+  const room = 5 - (slipped.length ? 1 : 0), shown = toDo.length <= room ? toDo : toDo.slice(0, room - 1), rest = toDo.slice(shown.length);
+  const todo = shown.map((r) => dueRow(r, now));
+  if (cardsDue) todo.push(row({ tag: "button", attrs: `data-act="review"`, lead: ICON.cards, title: "Flashcards", trail: `${count(cardsDue)} due`, chev: true }));
+  if (rest.length) todo.push(fold("more", "More today", rest.length, rest.map((r) => dueRow(r, now)).join(""), "ticks"));
+  if (slipped.length) todo.push(fold("slipped", "Slipped", slipped.length, slipped.map((r) => dueRow(r, now)).join(""), "ticks"));
 
-  html += `<h2 class="section">Due soon</h2>`;
-  const quiet = !slipped.length && !soon.some((r) => r.days === 0);
-  const visible = allDue ? soon : soon.slice(0, 6);
-  html += `<ul class="group">
-    ${quiet ? row({ lead: ICON.check.replace('class="glyph"', 'class="glyph success"'), title: soon.length ? "Nothing due today" : "Nothing due in the next seven days", cls: "quiet" }) : ""}
-    ${slipped.length ? row({ tag: "button", attrs: `data-act="slipped" aria-expanded="${openSlipped}" aria-label="Slipped, ${slipped.length}"`, lead: ICON.clock.replace('class="glyph"', 'class="glyph warn"'),
-      title: "Slipped", titleCls: "warn", trail: String(slipped.length), cls: "fold", chev: true }) : ""}
-    ${openSlipped ? slipped.map((r) => dueRow(r, now)).join("") : ""}
-    ${visible.map((r) => dueRow(r, now)).join("")}
-    ${soon.length > 6 ? row({ tag: "button", attrs: `data-act="all-due"`, title: allDue ? "Show less" : "Show all", cls: "more" }) : ""}
-  </ul>`;
-  if (cardsDue) html += `<button class="btn primary mt-20" type="button" data-act="review">Review ${plural(cardsDue, "card")}</button>`;
-  if (later.length) {
-    html += `<h2 class="section">Coursework</h2><ul class="group flat">${later.map((r) => row({ tag: "button", attrs: `data-cw="${esc(r.id)}" aria-label="${esc(r.title)}, ${esc(r.left)}"`,
-      title: esc(r.title), sub: esc(shorten(r.detail)), trail: esc(datesShown.has(r.id) ? shortDay(addDays(today, r.days)) : countdown(r.days)) })).join("")}</ul>`;
+  const time = (t) => `<span class="time">${esc(t)}</span>`;
+  const event = (e, cls = "") => { const b = briefAt.get(e.start.getTime()), gym = !b && gymHook() && GYM.test(e.title);
+    return row({ tag: b || gym ? "button" : "div", attrs: `data-item="${esc(e.id)}"${b ? ` data-open="note:${esc(b.id)}"` : gym ? ` data-act="gym"` : ""}`, lead: time(e.time), title: esc(e.title),
+      sub: esc([b && briefLabel(b), place(e.location)].filter(Boolean).join(" · ")), chev: !!b || gym }).replace("<li>", `<li class="${cls}">`); };
+  const tl = [];
+  if (sched.allDay.length) tl.push(row({ lead: time("All day"), title: esc(sched.allDay.join(", ")), titleCls: "one" }));
+  if (sched.past.length) tl.push(fold("earlier", `${sched.past.length} earlier`, null, sched.past.map((e) => event(e, "past")).join(""), "tl"));
+  for (const e of sched.now) tl.push(event(e, "now"));
+  if (hasDay) tl.push(`<li class="nowline" aria-label="Now, ${clock(at)}"><time>${clock(at)}</time><i></i></li>`);
+  sched.next.forEach((e, i) => tl.push(event(e, i === 0 && !sched.now.length ? "next" : "")));
+  if (!sched.now.length && !sched.next.length) tl.push(row({ lead: time(""), title: "Nothing else today", cls: "quiet" }));
+  // Rest of the week, to Sunday: classes (with their briefs) and what falls due, by day.
+  const week = [
+    ...upNext({ events, notes: [...noteById.values()] }, at).filter((r) => r.kind === "class" && r.day > today)
+      .map((r) => ({ day: r.day, at: r.at, html: row({ tag: r.open ? "button" : "div", attrs: `data-item="${esc(r.id)}"${r.open ? ` data-open="${esc(r.open)}"` : ""}`,
+        lead: time(r.time), title: esc(r.title), sub: esc(r.sub.split(" · ").map(place).join(" · ")), chev: !!r.open }) })),
+    ...weekDue.map((r) => ({ day: r.date.slice(0, 10), at: r.time ? Date.parse(`${r.date.slice(0, 10)}T${r.time}`) : -Infinity,
+      html: row({ tag: r.kind === "task" ? "button" : "div", attrs: r.kind === "task" ? `data-task="${esc(r.id)}" data-item="${esc(r.id)}"` : `data-item="${esc(itemId(r.id))}"`,
+        lead: time(r.time ?? (r.kind === "task" ? "" : "Due")), title: esc(r.title), sub: r.kind === "task" ? "" : esc(shorten(r.detail)) }) })),
+  ].sort((a, b) => cmpDay(a.day, b.day) || a.at - b.at);
+  if (week.length) {
+    let body = "", last = "";
+    for (const w of week) { if (w.day !== last) { body += `<li class="dayhead">${esc(dayName(w.day, today))}</li>`; last = w.day; } body += w.html; }
+    tl.push(fold("week", "Rest of the week", week.length, body, "tl"));
   }
-  if (caps.length) {
-    html += `<h2 class="section">Captures</h2><ul class="group flat">${caps.slice(0, 3).map(captureRow).join("")}
-      ${caps.length > 3 ? row({ tag: "button", attrs: `data-tab="capture"`, title: "Show all", cls: "more" }) : ""}</ul>`;
-  }
-  paint($("today"), html + foot);
+  const big = later[0];
+  paint($("day-scroll"), `<p class="caption-h">To do</p>
+    ${todo.length ? `<ul class="list ticks">${todo.join("")}</ul>` : `<p class="foot empty-line">Nothing due today.</p>`}
+    <p class="caption-h">Today</p><ul class="list tl">${tl.join("")}</ul>
+    ${big ? `<p class="day-foot" data-item="${esc(big.id)}">Next big deadline: ${esc(big.title)} in ${esc(big.left)}</p>` : ""}${foot}`);
+  const open = toDo.concat(slipped).filter((r) => !(held.get(r.id)?.kind === "done")).length + (cardsDue ? 1 : 0);
+  $("day-sum-text").textContent = `${open ? `${count(open)} to do` : "Nothing to do"} · ${sched.next.length ? `${count(sched.next.length)} more today` : "Nothing else today"}`;
   updateFoot();
+}
+const cmpDay = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const count = (n) => n.toLocaleString("en-GB"); // "1,284"
+/** A milestone's id is "<assessment id>#<date><label>"; a link to it names the assessment. */
+const itemId = (id) => String(id).split("#")[0];
+/** A meeting link as a place: "Teams", "Zoom" or the host, so a URL never fills the line. */
+const place = (s) => { if (!/^https?:\/\//i.test(s ?? "")) return s ?? "";
+  try { const h = new URL(s).hostname; return /teams\./.test(h) ? "Teams" : /zoom\./.test(h) ? "Zoom" : h.replace(/^www\./, ""); } catch { return "Online"; } };
+/** Train's hook for a gym event (train.openToday lands from the Train branch; until then the Train tab opens). */
+const GYM = /\bgym\b/i;
+const gymHook = () => trainOn;
+
+/** What now: the event on now (with a progress track), else the next one today, else the next day's first; one prep action. */
+function heroHtml(e, briefAt, at) {
+  if (!e) return `<section class="hero" aria-label="What now"><div class="hgrid"><p class="k">Today</p><span></span><h2>No more events today</h2></div></section>`;
+  const f = heroFigure(e, at), b = briefAt.get(e.start.getTime());
+  const cls = e.state === "now" ? classNow(events, modules, lectures, at) : null;
+  const where = place(e.location), url = where !== (e.location ?? "") && /^https:\/\//i.test(e.location);
+  const action = gymHook() && GYM.test(e.title) ? `<button class="btn secondary small act" type="button" data-act="gym">${ICON.dumbbell}Open Train</button>`
+    : cls ? `<button class="btn secondary small act" type="button" data-act="note-class" data-m="${esc(cls.module)}" data-l="${esc(cls.lecture ?? "")}">${ICON.note}Note for this class</button>`
+    : b ? `<button class="btn secondary small act" type="button" data-open="note:${esc(b.id)}">${ICON.doc}${esc(Number(b.data?.minutes) > 0 ? `Brief · ${prep(b.data.minutes)}` : "Brief")}</button>`
+    : url ? `<a class="btn secondary small act" href="${esc(e.location)}" target="_blank" rel="noopener noreferrer">${ICON.open}Join</a>`
+    : where ? `<a class="btn secondary small act" href="https://maps.apple.com/?q=${encodeURIComponent(where)}" target="_blank" rel="noopener noreferrer">${ICON.pin}Directions</a>` : "";
+  // A countdown in hours needs the width: the right caption joins the left one and the title takes its own row.
+  const wide = / h\b/.test(f.fig);
+  const progress = e.state === "now" && e.end ? Math.min(1, Math.max(0, (at - e.start) / (e.end - e.start))) : null;
+  return `<section class="hero" aria-label="What now">
+    <div class="hgrid${wide ? " wide" : ""}"><p class="k">${esc(wide ? `${f.label} · ${f.k.toLowerCase()}` : f.label)}</p>${wide ? "" : `<p class="k r">${esc(f.k)}</p>`}
+      <h2${e.title.length > 24 ? ` class="long"` : ""}>${esc(e.title)}</h2><b class="fig">${esc(f.fig)}</b>
+      ${where || f.range ? `<p class="where">${esc(where)}</p><span class="range">${esc(f.range)}</span>` : ""}</div>
+    ${progress != null ? `<div class="track" role="progressbar" aria-label="Time through" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(progress * 100)}"><time>${clock(e.start)}</time><span class="rail"><i style="transform:scaleX(${progress.toFixed(3)})"></i></span><time>${clock(e.end)}</time></div>` : ""}
+    ${action}
+  </section>`;
+}
+
+/** The priority: one line with its tick (when it is one of the tasks), its due day in the caption, the why clamped to 2 lines. */
+function prioHtml(p, pTask, today, now, items = []) {
+  if (!p) return "";
+  const why = typeof p.why === "string" ? withoutGreeting(p.why) : "";
+  const day = typeof p.due === "string" && /^\d{4}-\d{2}-\d{2}/.test(p.due) ? p.due.slice(0, 10) : null, days = day ? daysBetween(today, day) : null;
+  const h = pTask && held.get(pTask.id), done = !!pTask && (h?.kind === "done" || pTask.user_data?.done === true);
+  const when = days == null ? "" : days < 0 ? `was due ${shortDay(day)}` : `due ${days <= 1 ? dayName(day, today).toLowerCase() : shortDay(day)}`;
+  const text = `<span class="text"><span class="title">${esc(p.title)}</span>${why ? `<span class="why">${esc(why)}</span>` : ""}</span>`;
+  return `<section class="prio" aria-label="Priority"${items.length ? ` data-item="${esc(items.join(" "))}"` : ""}><p class="cap">Priority${when ? ` · <span class="${days < 0 && !done ? "warn" : ""}">${esc(when)}</span>` : ""}</p>
+    <div class="prio-line${done ? " done" : ""}${h && now - h.at < 450 ? " just" : ""}">${pTask
+      ? `${tickButton(pTask.id, p.title, done)}<button class="row" type="button" data-task="${esc(pTask.id)}">${text}</button>` : `<div class="row">${text}</div>`}</div></section>`;
+}
+
+/** A fold in the day sheet: its DOM stays, so opening animates (grid rows, 240 ms) and the open ones survive redraws. */
+const dayFolds = new Set();
+function fold(key, label, n, body, listCls = "") {
+  const open = dayFolds.has(key);
+  return `<li class="fold${open ? " open" : ""}" data-fold="${key}"><button class="row fold-row" type="button" aria-expanded="${open}" data-act="fold"><span class="text"><span class="title">${esc(label)}${n != null ? ` · <span class="count">${count(n)}</span>` : ""}</span></span>${ICON.chev}</button>
+    <div class="fold-body"${open ? "" : " inert"}><div><ul class="list ${listCls}">${body}</ul></div></div></li>`;
+}
+function toggleFold(li, open = !li.classList.contains("open")) {
+  dayFolds[open ? "add" : "delete"](li.dataset.fold);
+  li.classList.toggle("open", open);
+  li.querySelector(":scope > .fold-row").setAttribute("aria-expanded", String(open));
+  li.querySelector(":scope > .fold-body").toggleAttribute("inert", !open);
 }
 
 /** The footnote's text is set on its own, so the minute clock never redraws the list around it. */
@@ -803,10 +863,10 @@ function updateFoot() {
 const tickButton = (id, title, done) =>
   `<button class="tick" type="button" data-tick="${esc(id)}" aria-pressed="${done}" aria-label="${done ? "Undo" : "Complete"}: ${esc(title)}">${TICK}</button>`;
 
-/** A Due soon row. Tasks get a tick and open the action sheet; slipped dates are the only warning colour. Only rows with a
- *  module or a role carry a subtitle. */
+/** A To do row. Tasks get a tick and open the task sheet; a slipped date is the only warning colour; a timed task shows its
+ *  time. Only rows with a module or a role carry a subtitle. */
 function dueRow(r, now) {
-  const label = dueText(r), sub = r.kind === "task" ? held.get(r.id)?.note ?? "" : shorten(r.detail);
+  const label = r.slipped ? shortDay(r.date) : r.time ?? "", sub = r.kind === "task" ? "" : shorten(r.detail);
   const text = `<span class="text"><span class="title clamp">${esc(r.title)}</span>${sub ? `<span class="subtitle">${esc(sub)}</span>` : ""}</span>`
     + (label ? `<span class="trail${r.slipped ? " warn" : ""}">${esc(label)}</span>` : "");
   if (r.kind !== "task") return `<li data-item="${esc(r.id)}"><div class="row">${r.kind === "application" ? ICON.briefcase : ICON.cap}${text}</div></li>`;
@@ -821,62 +881,197 @@ function captureRow(c) {
     trail: src ? `<img class="thumb-img" src="${esc(src)}" alt="">` : "" });
 }
 
+/** The + sheet's Note: a "For SM L3 · Change" chip over the field (the class on now, or the one picked; Change lists today's
+ *  classes and No class), and the recent captures under it. */
+let classPick = false; // the Change list is open
+const classLabel = (c) => c.label ?? [short(c.module), c.lecture].filter(Boolean).join(" ");
+function todaysClasses() {
+  const today = todayString(), seen = new Set();
+  // A class is an event classNow recognises at its own start time; one per module and lecture.
+  return events.filter((e) => localDay(Date.parse(e.data?.start) || 0) === today && !gone(e))
+    .sort((a, b) => Date.parse(a.data.start) - Date.parse(b.data.start))
+    .map((e) => { const at = new Date(Date.parse(e.data.start) + 6e4), c = classNow(events, modules, lectures, at); return c && { ...c, time: clock(new Date(Date.parse(e.data.start))) }; })
+    .filter((c) => c && !seen.has(c.module + "|" + c.lecture) && seen.add(c.module + "|" + c.lecture));
+}
 function renderCaptures() {
-  const caps = captureList(), on = classNow(events, modules, lectures);
-  $("capture").querySelector("textarea").placeholder = on ? `Note for ${on.label}` : "Note";
-  paint($("capture-list"), caps.length ? `<h2 class="section">Captures</h2><ul class="group flat">${caps.map(captureRow).join("")}</ul>` : "");
+  const caps = captureList(), on = captureFor ?? classNow(events, modules, lectures), list = todaysClasses();
+  if (on && !list.some((c) => c.module === on.module && c.lecture === on.lecture)) list.unshift(on); // "Note for this class" from a lecture page
+  const form = $("add-sheet").querySelector("[data-compose=add]"), chip = form?.querySelector(".chips");
+  if (chip) {
+    chip.hidden = !list.length;
+    paint(chip, `<button class="chip-btn" type="button" data-act="class-pick" aria-expanded="${classPick}"><span class="chip${on ? " on" : ""}">${on ? `For ${esc(classLabel(on))}` : "No class"}</span><span class="link">Change</span></button>`);
+    const pick = form.querySelector(".choices");
+    pick.hidden = !classPick || !list.length;
+    const same = (c) => !!on && c.module === on.module && c.lecture === on.lecture;
+    paint(pick, [...list.map((c, i) => row({ tag: "button", attrs: `data-class="${i}"`, title: esc(classLabel(c)), trail: `${esc(c.time ?? "")}${same(c) ? ICON.tickMark : ""}` })),
+      row({ tag: "button", attrs: `data-class="none"`, title: "No class", trail: on ? "" : ICON.tickMark })].join(""));
+    pick._list = list;
+  }
+  paint($("capture-list"), caps.length ? `<p class="caption-h">Recent</p><ul class="group flat">${caps.slice(0, 3).map(captureRow).join("")}</ul>` : "");
 }
 
-/** The task action sheet: Today, Tomorrow, Next week, Pick a date, Let go. */
+/** The task sheet: Today, Tomorrow, Next week (the task's own day ticked and not tappable), Pick a date, Let go. */
 function openTaskSheet(id) {
-  const task = tasks.find((t) => t.id === id), r = dueSoon([task], [], [], todayString())[0];
-  if (!task || !r) return;
+  const task = tasks.find((t) => t.id === id), r = task && dueSoon([task], [], [], todayString(), 3650)[0];
+  if (!task) return;
   sheetTask = id;
-  const today = todayString();
-  say("task-title", r.title);
-  say("task-detail", r.slipped ? "Was due " + shortDay(r.date) : r.date ? priorityDueLabel(r) : "");
-  $("task-moves").innerHTML = [
-    row({ tag: "button", attrs: `data-move="${today}"`, lead: ICON.sun, title: "Today", trail: shortDay(today) }),
-    row({ tag: "button", attrs: `data-move="${addDays(today, 1)}"`, lead: ICON.sunrise, title: "Tomorrow", trail: shortDay(addDays(today, 1)) }),
-    row({ tag: "button", attrs: `data-move="${nextMonday(today)}"`, lead: ICON.nextWeek, title: "Next week", trail: shortDay(nextMonday(today)) }),
+  const today = todayString(), date = effectiveDate(task)?.slice(0, 10) ?? null;
+  say("task-title", task.data?.title ?? task.title ?? "Task");
+  say("task-detail", !date ? "No date" : r?.slipped ? "Was due " + shortDay(date) : priorityDueLabel({ date, days: daysBetween(today, date) }), !!r?.slipped);
+  const opt = (day, glyph, label) => row({ tag: "button", attrs: day === date ? `disabled aria-current="date"` : `data-move="${day}"`, lead: glyph, title: label,
+    trail: shortDay(day) }).replace("</button>", day === date ? `${ICON.tickMark}</button>` : "</button>");
+  $("task-moves").innerHTML = [opt(today, ICON.sun, "Today"), opt(addDays(today, 1), ICON.sunrise, "Tomorrow"), opt(nextMonday(today), ICON.nextWeek, "Next week"),
     `<li><label class="row">${ICON.calendar}<span class="text"><span class="title">Pick a date</span></span>${ICON.chev}
-      <input type="date" class="overlay" data-pick min="${today}" value="${r.date && r.date > today ? esc(r.date) : today}" aria-label="Pick a date"></label></li>`,
+      <input type="date" class="overlay" data-pick min="${today}" value="${date && date > today ? esc(date) : today}" aria-label="Pick a date"></label></li>`,
   ].join("");
-  $("task-sheet").showModal();
+  openSheet($("task-sheet"));
 }
 
 // ---------- Inbox: every ping that has fired (docs/(C) Brief + ping contract.md §6) ----------
 
-function renderInbox() {
-  const { rows, unread } = inbox(pings, new Date());
-  $("inbox-badge").textContent = unread > 99 ? "99+" : String(unread);
-  $("inbox-badge").hidden = !unread;
-  $("tabs").querySelector('[data-tab="inbox"]').setAttribute("aria-label", unread ? `Inbox, ${unread} unread` : "Inbox");
-  const top = head("Inbox") + notices();
-  if (!loaded) return paint($("inbox"), top + SKELETON);
-  if (!rows.length) return paint($("inbox"), top + empty(ICON.bell, "No notifications yet", "Briefs, deadlines and reminders collect here as they arrive."));
-  paint($("inbox"), top + `<ul class="group inbox mt-20">${rows.map((x) => {
-    const done = x.user_data?.done === true, fresh = !x.user_data?.seenAt && !done, at = fireAt(x);
-    const sub = [when(at.getTime()) + (localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)), done && "Done"].filter(Boolean).join(" · ");
-    return `<li class="ping${done ? " done" : ""}" data-item="${esc(x.id)}">${fresh ? `<i class="dot" aria-hidden="true"></i>` : ""}
-      <button class="row" type="button" data-ping="${esc(x.id)}" aria-label="${fresh ? "Unread. " : ""}${esc(x.title ?? "")}, ${esc(sub)}"><span class="text"><span class="title${fresh ? " strong" : ""}">${esc(x.title ?? "Notification")}</span><span class="subtitle">${esc(sub)}</span></span></button>
-      <button class="more-btn" type="button" data-pmore="${esc(x.id)}" aria-label="Snooze or done: ${esc(x.title ?? "")}">${ICON.more}</button></li>`;
-  }).join("")}</ul>`);
+const PING_GLYPH = { moodle: "books", recording: "books", notes: "doc", brief: "doc", reask: "doc", readings: "doc", deadline: "clock", exam: "clock", application: "briefcase" };
+
+/** A Moodle ping from one sync carries `counts` per module (PingDetect.moodle, 17 Oct): more than one item reads as one
+ *  batched row, "Moodle · 3 new" over "M&S, CRG". Anything else keeps its own title. */
+function pingText(p) {
+  const counts = p.data?.kind === "moodle" && p.data?.counts && typeof p.data.counts === "object" ? Object.entries(p.data.counts) : [];
+  const n = counts.reduce((a, [, v]) => a + (Number(v) || 0), 0);
+  return n > 1 ? { title: `Moodle · ${n} new`, sub: counts.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([m]) => m).join(", ") } : { title: p.title ?? "Notification", sub: "" };
 }
 
-/** A ping's sheet: Snooze (1 h, 20:00 tonight, 08:00 tomorrow) and Done. Both mark it seen. */
+let inboxAll = false; // "Show N older" was tapped: Earlier shows every row
+const EARLIER = 20;
+function renderInbox() {
+  const { unread } = inbox(pings, new Date()), rows = inbox(pings, new Date()).rows.filter((p) => p.user_data?.done !== true);
+  $("inbox-badge").textContent = unread > 9 ? "9+" : String(unread);
+  $("inbox-badge").hidden = !unread;
+  $("tabs").querySelector('[data-tab="inbox"]').setAttribute("aria-label", unread ? `Inbox, ${unread} unread` : "Inbox");
+  $("read-all").hidden = !(tab === "inbox" && unread);
+  const top = head("Inbox") + notices();
+  if (!loaded) return paint($("inbox"), top + SKELETON);
+  if (!rows.length) return paint($("inbox"), top + empty(ICON.tray, "Nothing new", "Briefs, deadlines and Moodle updates land here.").replace('class="empty"', 'class="empty fill"'));
+  const today = todayString(), yesterday = addDays(today, -1), groups = new Map();
+  for (const p of rows) {
+    const day = localDay(fireAt(p).getTime()), g = day === today ? "Today" : day === yesterday ? "Yesterday" : "Earlier";
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(p);
+  }
+  const rowHtml = (p) => {
+    const fresh = !p.user_data?.seenAt, at = fireAt(p), day = localDay(at.getTime()), { title, sub } = pingText(p);
+    const time = day === today || day === yesterday ? clock(at) : shortDay(day);
+    // The swipes have no VoiceOver or Switch Control path, so each row also has a hidden button for its sheet.
+    return `<li class="ping${fresh ? " unread" : ""}" data-swipe="${esc(p.id)}"><div class="swipe-bg" aria-hidden="true"><span class="l">Later</span><span class="r">Done</span></div>
+      <div class="slide"><button class="row" type="button" data-ping="${esc(p.id)}" aria-label="${fresh ? "Unread. " : ""}${esc(title)}${sub ? ", " + esc(sub) : ""}, ${esc(time)}">${fresh ? `<i class="dot" aria-hidden="true"></i>` : ""}${ICON[PING_GLYPH[p.data?.kind]] ?? ICON.bell}<span class="text"><span class="title clamp">${esc(title)}</span>${sub ? `<span class="subtitle">${esc(sub)}</span>` : ""}</span><span class="trail">${esc(time)}</span></button></div>
+      <button class="sr-only" type="button" data-pmore="${esc(p.id)}">Snooze or mark done: ${esc(title)}</button></li>`;
+  };
+  paint($("inbox"), top + [...groups].map(([g, ps]) => {
+    const cut = g === "Earlier" && !inboxAll && ps.length > EARLIER + 2 ? ps.length - EARLIER : 0; // never "Show 1 older"
+    return `<p class="caption-h" role="heading" aria-level="2">${g}</p><ul class="group inbox">${ps.slice(0, ps.length - cut).map(rowHtml).join("")}${cut
+      ? row({ tag: "button", attrs: `data-act="inbox-older"`, title: `Show ${cut} older`, cls: "more" }) : ""}</ul>`;
+  }).join(""));
+}
+
+/** A ping's sheet (hold a row, or its hidden button): Open, Snooze (1 h, 20:00 tonight, 08:00 tomorrow) and Mark as done. */
 function openPingSheet(id) {
   const p = pings.find((x) => x.id === id);
   if (!p) return;
   sheetPing = id;
-  const done = p.user_data?.done === true;
-  say("ping-title", p.title ?? "Notification");
+  say("ping-title", pingText(p).title);
   const at = fireAt(p);
-  say("ping-when", at ? `${when(at.getTime())}${localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)}` : "");
-  $("ping-moves").innerHTML = snoozeChoices(new Date()).map(([label, d]) =>
-    row({ tag: "button", attrs: `data-snooze="${d.toISOString().replace(/\.\d{3}Z$/, "Z")}"`, lead: ICON.clock, title: label, trail: clock(d) })).join("");
-  say("ping-done-label", done ? "Mark as not done" : "Done");
-  $("ping-sheet").showModal();
+  say("ping-when", [pingText(p).sub, at && `${when(at.getTime())}${localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)}`].filter(Boolean).join(" · "));
+  $("ping-moves").innerHTML = (typeof p.data?.open === "string" ? row({ tag: "button", attrs: "data-popen", lead: ICON.open, title: "Open" }) : "")
+    + snoozeChoices(new Date()).map(([label, d]) =>
+      row({ tag: "button", attrs: `data-snooze="${d.toISOString().replace(/\.\d{3}Z$/, "Z")}"`, lead: ICON.clock, title: label, trail: clock(d) })).join("");
+  openSheet($("ping-sheet"));
+}
+
+/** Swipe left = Done, right = Later (the first snooze, an hour), then a 5 s Undo that puts user_data back as it was. */
+function triage(id, done) {
+  const p = pings.find((x) => x.id === id);
+  if (!p) return;
+  const was = p.user_data ?? {}, keys = done ? ["done", "doneAt", "seenAt"] : ["snoozedUntil", "seenAt"];
+  const later = snoozeChoices(new Date())[0][1];
+  pingWrite(id, done ? { done: true, doneAt: Date.now() } : { snoozedUntil: later.toISOString().replace(/\.\d{3}Z$/, "Z"), seenAt: null });
+  render();
+  toast(done ? "Marked done" : `Snoozed until ${clock(later)}`, () => {
+    writeUser(p, Object.fromEntries(keys.map((k) => [k, was[k] ?? (k === "done" ? false : null)])), "edit");
+    render();
+  });
+}
+
+/** Marks every unread ping in the Inbox seen, with Undo. */
+function readAll() {
+  const fresh = inbox(pings, new Date()).rows.filter((p) => !p.user_data?.seenAt && p.user_data?.done !== true);
+  for (const p of fresh) pingWrite(p.id, {});
+  render();
+  toast(`${plural(fresh.length, "notification")} marked read`, () => { for (const p of fresh) writeUser(p, { seenAt: null }, "edit"); render(); });
+}
+
+/** Inbox rows: 10 px of hysteresis, then a horizontal drag tracks 1:1 (vertical stays the page's scroll, touch-action pan-y).
+ *  On release it commits past 40% of the width, or past 20% with a flick over .11 px/ms in the drag's direction (the lift
+ *  counts, so a drag that pauses before it is not a flick); otherwise it snaps back. A row
+ *  caught mid snap-back is picked up where it is. Holding still for 500 ms opens the ping's sheet. One pointer at a time. */
+function inboxGestures(root) {
+  let g = null;
+  const label = (li, x) => { // the Done / Later label rides 16 px off the slide's edge once 88 px are open
+    const l = li.querySelector(x < 0 ? ".swipe-bg .r" : ".swipe-bg .l");
+    if (l) l.style.transform = `translateX(${x < 0 ? Math.min(0, x + 88) : Math.max(0, x - 88)}px)`;
+  };
+  const reset = (li) => { delete li.dataset.dir; for (const l of li.querySelectorAll(".swipe-bg span")) l.style.transform = ""; };
+  const place = (li, x) => { li.dataset.dir = x > 0 ? "r" : "l"; li.querySelector(".slide").style.transform = `translateX(${x}px)`; label(li, x); };
+  root.addEventListener("pointerdown", (e) => {
+    const li = e.target.closest("[data-swipe]");
+    if (g || !li || e.button > 0 || li.dataset.leaving || e.target.closest("[data-pmore]")) return;
+    const slide = li.querySelector(".slide"), at = new DOMMatrix(getComputedStyle(slide).transform).m41;
+    slide.getAnimations().forEach((a) => a.cancel());
+    g = { li, id: e.pointerId, x: e.clientX - at, y: e.clientY, on: Math.abs(at) > .5, held: false, hist: [[e.timeStamp, e.clientX]] };
+    if (g.on) { place(li, at); try { li.setPointerCapture(e.pointerId); } catch { /* not capturable */ } return; }
+    g.hold = setTimeout(() => {
+      if (!g || g.on) return;
+      g.held = true; // kept until the lift, so the lift can't land on the sheet it opened
+      try { li.setPointerCapture(g.id); } catch { /* not capturable */ }
+      openPingSheet(li.dataset.swipe);
+    }, 500);
+  });
+  addEventListener("pointermove", (e) => {
+    if (!g || e.pointerId !== g.id || g.held) return;
+    const dx = e.clientX - g.x, dy = e.clientY - g.y;
+    if (!g.on) {
+      if (Math.hypot(dx, dy) > 10) clearTimeout(g.hold);
+      if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { g = null; return; }
+      if (Math.abs(dx) < 10) return;
+      g.on = true; g.x += Math.sign(dx) * 10; // no jump at the threshold
+      try { g.li.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
+    }
+    g.hist.push([e.timeStamp, e.clientX]); while (g.hist.length > 2 && e.timeStamp - g.hist[0][0] > 100) g.hist.shift();
+    place(g.li, e.clientX - g.x);
+  });
+  const up = (e) => {
+    if (!g || e.pointerId !== g.id) return;
+    clearTimeout(g.hold);
+    if (g.held) { g = null; suppressClick = Date.now() + 350; return; }
+    g.hist.push([e.timeStamp, e.clientX]); while (g.hist.length > 2 && e.timeStamp - g.hist[0][0] > 100) g.hist.shift(); // the lift counts
+    const { li, on, hist: h } = g, x = e.clientX - g.x, v = (h.at(-1)[1] - h[0][1]) / Math.max(1, h.at(-1)[0] - h[0][0]);
+    g = null;
+    if (!on) return;
+    suppressClick = Date.now() + 350;
+    const slide = li.querySelector(".slide"), w = slide.offsetWidth;
+    const commit = e.type !== "pointercancel" && x !== 0 && (Math.abs(x) > w * .4 || (Math.abs(x) > w * .2 && Math.abs(v) > .11 && Math.sign(v) === Math.sign(x)));
+    slide.style.transform = "";
+    if (!commit) {
+      if (still()) return reset(li);
+      for (const l of li.querySelectorAll(".swipe-bg span")) l.style.transform = "";
+      slide.animate([{ transform: `translateX(${x}px)` }, { transform: "none" }], { duration: 300, easing: DRAWER }).onfinish = () => reset(li);
+      return;
+    }
+    const done = x < 0, id = li.dataset.swipe;
+    li.dataset.leaving = "1";
+    if (still()) return triage(id, done);
+    slide.animate([{ transform: `translateX(${x}px)` }, { transform: `translateX(${done ? -w : w}px)` }], { duration: 180, easing: DRAWER, fill: "forwards" }).onfinish = () =>
+      li.animate([{ height: li.offsetHeight + "px" }, { height: 0 }], { duration: 220, easing: DRAWER, fill: "forwards" }).onfinish = () => triage(id, done);
+  };
+  addEventListener("pointerup", up); addEventListener("pointercancel", up);
+  root.addEventListener("contextmenu", (e) => { const li = e.target.closest("[data-swipe]"); if (li) { e.preventDefault(); openPingSheet(li.dataset.swipe); } });
 }
 
 /** Open, Done and Snooze write user_data (with userAt, as every write does). Open and Done mark the ping seen; Snooze
@@ -931,9 +1126,20 @@ function openTarget(target) {
   }
   if (kind === "item") {
     switchTab("today");
-    // Its own card: a task's Due soon row, else Schedule or Due soon, Coursework, then Up next.
-    const el = ["row", "item", "cw", "next"].map((a) => $("today").querySelector(`[data-${a}="${CSS.escape(id)}"]`)).find(Boolean);
-    if (!el) return false;
+    // Its own row on Today: the priority (which stands for its task and the deadlines it swallowed), a task's row, the
+    // timeline or the week (the day sheet then opens full, its fold open), or the next-big-deadline line.
+    const q = `[data-row="${CSS.escape(id)}"], [data-item~="${CSS.escape(id)}"]`, el = $("today").querySelector(q) ?? (todaySheet ? $("day").querySelector(q) : null);
+    if (!el) { // in local data but not on Today: its module, or the task's own sheet
+      const x = [...assessments, ...tasks, ...applications].find((r) => r.id === id);
+      if (!x) return false;
+      if (x.module) study([{ s: "module", m: x.module }]);
+      else if (tasks.includes(x)) openTaskSheet(id);
+      return true;
+    }
+    if (el.closest("#day")) {
+      for (let f = el.closest(".fold"); f; f = f.parentElement.closest(".fold")) toggleFold(f, true);
+      daySheet.go("full");
+    }
     el.scrollIntoView({ block: "center", behavior: still() ? "auto" : "smooth" });
     el.classList.add("spot");
     setTimeout(() => el.classList.remove("spot"), 1600);
@@ -958,7 +1164,7 @@ function openTarget(target) {
 }
 /** Study, at these screens under its home. */
 function study(screens) {
-  setContents(false);
+  setMenu(null, true);
   tabY[tab] = scrollY;
   tab = "study";
   stack = [{ s: "home" }, ...screens];
@@ -991,20 +1197,23 @@ function prefetch(path) {
     .finally(render);
 }
 
-/** The player above a brief that has audio scripts or a recording: Play, Short or Full, and speed. */
+/** Listen, one compact row under the title: ▶ · Listen · 7 min · Short/Full (only when both exist) · 1×. The length is
+ *  the recording's once it has loaded, else the script read at 160 words a minute; "phone voice" when there's no recording. */
 function playerHtml(n) {
   const version = player.id === n.id ? player.version : "short", path = recording(n, version);
   if (!path && !script(n, "short") && !script(n, "full")) return "";
   prefetch(path);
-  const mine = player.id === n.id, file = path ? blobs.get(path) : false, waiting = file === null;
-  const label = mine && player.playing ? "Pause" : waiting ? "Loading…" : mine && player.started ? "Resume" : "Play";
+  const mine = player.id === n.id, file = path ? blobs.get(path) : false, waiting = file === null, on = mine && player.playing;
   const both = (recording(n, "short") || script(n, "short")) && (recording(n, "full") || script(n, "full"));
-  return `<div class="player" data-player="${esc(n.id)}">
-    <button class="btn primary" type="button" data-play="${esc(n.id)}"${waiting ? " disabled" : ""}>${mine && player.playing ? ICON.pause : ICON.play}${label}</button>
-    <div class="player-row">${both ? `<div class="seg" role="tablist" aria-label="Which version" style="--n: 2; --i: ${version === "short" ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["short", "Short"], ["full", "Full"]]
+  const secs = mine && !player.speech && Number.isFinite(audio.duration) ? audio.duration : (script(n, version).match(/\S+/g)?.length ?? 0) / 160 * 60;
+  const label = waiting ? "Loading" : mine && player.started && !on ? "Resume" : "Listen";
+  const len = [secs && `${Math.max(1, Math.round(secs / 60))} min`, file === false && !both && "phone voice"].filter(Boolean).map((x) => ` · ${x}`).join("");
+  return `<div class="listen" data-player="${esc(n.id)}">
+    <button class="playb" type="button" data-play="${esc(n.id)}" aria-label="${on ? "Pause" : label}"${waiting ? " disabled" : ""}><i>${on ? ICON.pause : ICON.play}</i></button>
+    <span class="what">${label}</span><span class="len">${len}</span>
+    ${both ? `<div class="seg" role="tablist" aria-label="Which version" style="--n: 2; --i: ${version === "short" ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["short", "Short"], ["full", "Full"]]
       .map(([v, l]) => `<button type="button" role="tab" data-ver="${v}" aria-selected="${version === v}">${l}</button>`).join("")}</div>` : ""}
-      <button class="btn secondary small" type="button" data-speed aria-label="Speed ${speed} times">${speed}×</button></div>
-    ${file === false ? `<p class="foot">${path ? "Couldn’t load the recording, so" : "No recording yet, so"} the phone’s voice reads it.</p>` : ""}
+    <button class="rate" type="button" data-speed aria-label="Speed ${speed} times">${speed}×</button>
   </div>`;
 }
 
@@ -1058,12 +1267,13 @@ audio.onratechange = audio.onseeked = audio.onloadedmetadata = position;
 
 // ---------- Add (To-do | Note) ----------
 
-let captureFor = null; // {module, lecture}: the Add sheet's note goes to this class (a lecture's "Note for this class")
+let captureFor = null; // {module, lecture}: the Add sheet's note goes to this class (a lecture's "Note for this class", or Change); false: No class
 
 function openAdd(mode = "todo") {
   for (const el of $("add-sheet").querySelectorAll("[role=status]")) say(el, "");
   setMode(mode);
-  $("add-sheet").showModal();
+  renderCaptures(); // the chip says where this note goes now, not where the last one went
+  openSheet($("add-sheet"));
   setTimeout(() => (mode === "todo" ? $("todo") : $("add-sheet").querySelector("textarea")).focus(), 60);
 }
 
@@ -1079,13 +1289,14 @@ function setMode(mode) {
 /** Parse as you type: the date phrase is highlighted in place and the Date row shows the day. */
 function updateTodo() {
   const input = $("todo"), value = input.value, today = todayString();
-  const p = todoParse = parseWhen(value, today, todoIgnore);
+  const p = todoParse = parseWhen(value, today, todoIgnore, new Date());
   if (p.date && todoManual) todoManual = null; // a date typed after picking one wins: the most recent choice counts
   $("todo-mirror").innerHTML = p.start < 0 ? esc(value)
     : `${esc(value.slice(0, p.start))}<mark>${esc(value.slice(p.start, p.end))}</mark>${esc(value.slice(p.end))}`;
   $("todo-mirror").scrollLeft = input.scrollLeft;
   const date = todoManual ?? p.date, past = !!date && date < today;
   say("todo-date-label", !date ? "None" : past ? `Past date · ${shortDay(date)}` : dayName(date, today), past);
+  $("todo-date-label").classList.toggle("link", !!date && !past); // the parsed (or picked) date is state: the accent
   $("todo-date").value = date ?? ""; // no min here: a typed past date is allowed, and the form never validates it (novalidate)
   $("todo-save").disabled = !value.trim();
 }
@@ -1097,20 +1308,22 @@ function resetTodo() {
 
 function saveTodo(e) {
   e.preventDefault();
-  const p = todoParse ?? parseWhen($("todo").value, todayString(), todoIgnore);
+  const p = todoParse ?? parseWhen($("todo").value, todayString(), todoIgnore, new Date());
   if (!p.title.trim()) return;
   const date = todoManual ?? p.date;
   addTask(p.title, date);
   resetTodo();
   // The sheet stays open for the next one, and says where this one went: a date past Due soon's week is off Today.
-  say("todo-status", date ? `Added for ${dayName(date).replace(/^(Today|Tomorrow)$/, (w) => w.toLowerCase())}` : "Added");
+  say("todo-status", `Added ‘${p.title}’${date ? ` for ${dayName(date).replace(/^(Today|Tomorrow)$/, (w) => w.toLowerCase())}` : ""}`);
   clearTimeout(saveTodo.timer);
   saveTodo.timer = setTimeout(() => say("todo-status", ""), 4000);
   $("todo").focus();
 }
 
 /** The note composer (Capture tab and the Add sheet's Note): text, an optional photo, Save. */
-const composer = () => `<ul class="group flat">
+const composer = () => `<div class="chips" hidden></div>
+  <ul class="group flat choices" hidden></ul>
+  <ul class="group flat">
     <li><textarea name="body" rows="5" placeholder="Note" aria-label="Note"></textarea></li>
     <li class="preview-li" hidden><div class="preview"><img alt="Photo to attach"></div></li>
     <li><label class="row photo"><input type="file" name="photo" accept="image/*" capture="environment" aria-label="Add photo">${ICON.camera}
@@ -1118,7 +1331,8 @@ const composer = () => `<ul class="group flat">
     <li class="remove-li" hidden><button class="row" type="button" data-remove-photo>${ICON.xmark}<span class="text"><span class="title link">Remove photo</span></span></button></li>
   </ul>
   <button class="btn primary" type="submit" disabled>Save</button>
-  <p class="foot" role="status"></p>`;
+  <p class="foot" role="status"></p>
+  <div id="capture-list"></div>`;
 /** Save needs a note or a photo. */
 const canSave = (form) => { form.querySelector("[type=submit]").disabled = !form.elements.body.value.trim() && !photos[form.dataset.compose]; };
 
@@ -1130,44 +1344,57 @@ function openReview(module = null, lecture = null) {
   tabY.review = scrollY;
   reviewReturn = document.activeElement;
   reviewing = true;
+  $("review").classList.remove("out");
   render();
 }
+/** Back down the way it came: 200 ms (the open is 280), then the page underneath. */
 function closeReview() {
-  reviewing = false;
-  render();
-  scrollTo(0, tabY.review ?? 0);
-  const back = reviewReturn?.isConnected ? reviewReturn : $(tab).querySelector('[data-act="review"]') ?? $("tabs").querySelector("[aria-current]");
-  back?.focus({ preventScroll: true });
+  const el = $("review");
+  if (!reviewing || el.classList.contains("out")) return;
+  const done = () => {
+    el.classList.remove("out");
+    reviewing = false;
+    render();
+    scrollTo(0, tabY.review ?? 0);
+    const back = reviewReturn?.isConnected ? reviewReturn : $(tab).querySelector('[data-act="review"]') ?? $("tabs").querySelector("[aria-current]");
+    back?.focus({ preventScroll: true });
+  };
+  if (still()) return done();
+  el.classList.add("out");
+  el.addEventListener("animationend", function end(e) { if (e.target === el) { el.removeEventListener("animationend", end); done(); } });
 }
 
+/** Again or Good, each with the interval it sets. Tap anywhere reveals; grading moves on at once (100 a day, so no motion). */
 function renderReview(today) {
   if (!reviewing) return;
   const close = `<button class="circle" type="button" data-act="close-review" aria-label="Close">${ICON.close}</button>`;
   const card = current(), total = session.queue.length;
+  const bar = (at) => `<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${at}"><i style="transform: scaleX(${total ? (at / total).toFixed(3) : 1})"></i></div>`;
   if (!loaded || !card) {
-    const done = new Set(session.queue.slice(0, session.index)).size, next = nextDue(cards, today);
-    const nextText = next ? `Next cards due ${daysBetween(today, next) === 1 ? "tomorrow" : shortDay(next)}.` : "";
-    paint($("review"), `<div class="review-top"></div>
-      ${empty(ICON.check, done ? `${plural(done, "card")} reviewed` : "Nothing due", nextText || "Every card is scheduled for later.")}
-      <div class="review-bar chrome"><button class="btn primary" type="button" data-act="close-review">Done</button></div>`);
+    const done = new Set(session.queue.slice(0, session.index)).size, next = nextDue(cards, today), more = dueFor(session.module, session.lecture).length;
+    const [again, , good] = session.grades;
+    paint($("review"), `<div class="review-top">${close}</div>${bar(total)}
+      ${done ? `<div class="empty rv-done">${ICON.check.replace('class="glyph"', "")}<h2>${num(done)} ${done === 1 ? "card" : "cards"}</h2><p>${num(good)} Good · ${num(again)} Again</p></div>`
+        : empty(ICON.check, "Nothing due", next ? `Next cards due ${daysBetween(today, next) === 1 ? "tomorrow" : shortDay(next)}.` : "Every card is scheduled for later.")}
+      <div class="review-bar">${more ? `<button class="btn secondary" type="button" data-act="review-more">Review ${num(Math.min(more, CAP))} more</button>` : ""}
+        <button class="btn primary" type="button" data-act="close-review">Back to Study</button></div>`);
     return focusReview();
   }
   const where = [short(card.module), card.data?.lecture].filter(Boolean).join(" · ");
-  const exam = examFor(card);
-  paint($("review"), `<div class="review-top">${close}<p class="count">${session.index + 1} of ${total}</p></div>
-    <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${session.index}"><i style="width:${(session.index / Math.max(total, 1)) * 100}%"></i></div>
-    <article class="flash" data-act="flip">
+  const exam = examFor(card), after = (g) => intervalLabel(schedule(card.user_data ?? {}, g, exam, today).interval);
+  paint($("review"), `<div class="review-top">${close}<p class="count">${num(session.index + 1)} of ${num(total)}</p></div>${bar(session.index)}
+    <article class="flash" data-act="flip" aria-live="polite">
       <div class="qa">${where ? `<p class="foot">${esc(where)}</p>` : ""}<h2 class="front">${esc(card.data?.front ?? card.title ?? "")}</h2>
       ${session.flipped ? `<hr><p class="answer">${esc(card.data?.back ?? "")}</p>` : ""}</div>
     </article>
-    <div class="review-bar chrome">${session.flipped
-      ? NAMES.map((n, g) => `<button class="grade${g === 2 ? " good" : ""}" type="button" data-grade="${g}"><b>${n}</b><small>${intervalLabel(schedule(card.user_data ?? {}, g, exam, today).interval)}</small></button>`).join("")
-      : `<button class="btn primary" type="button" data-act="flip">Show answer</button>`}</div>`);
+    <div class="review-bar">${session.flipped
+      ? `<button class="grade" type="button" data-grade="0"><b>Again</b><small>${after(0)}</small></button><button class="grade good" type="button" data-grade="2"><b>Good</b><small>${after(2)}</small></button>`
+      : `<button class="btn secondary" type="button" data-act="flip">Show answer</button>`}</div>`);
   focusReview();
 }
 /** Focus stays inside the review: on its main button, after every redraw. */
 function focusReview() {
-  if (!$("review").contains(document.activeElement)) ($("review").querySelector(".review-bar .good") ?? $("review").querySelector(".review-bar button"))?.focus({ preventScroll: true });
+  if (!$("review").contains(document.activeElement)) ($("review").querySelector(".review-bar .good, .review-bar .primary") ?? $("review").querySelector(".review-bar button"))?.focus({ preventScroll: true });
 }
 
 // ---------- Study (Sources/(C) View Study.swift: modules → lectures → reader, review, attempt-first practice) ----------
@@ -1189,32 +1416,94 @@ function screenTitle(sc) {
   if (sc.s === "module") return short(sc.m);
   if (sc.s === "lecture") { const l = lectures.find((x) => x.id === sc.id); return [short(l?.module), l?.data?.n].filter(Boolean).join(" ") || "Lecture"; }
   if (sc.s === "practice") return "Practice";
-  if (sc.s === "note") return "Notes";
+  if (sc.s === "note") { const n = noteById.get(sc.id); return docTitle(n) ?? (n?.data?.kind === "map" ? "Module map" : "Notes"); }
   return "Study";
 }
 
-/** Push and pop slide 24 px over 280 ms (startViewTransition); without it, they just swap. */
+/** Push and pop: the page slides 32 px and fades in over 280 ms on the drawer curve; the bar and tab bar stay put. */
 function navigate(dir, change) {
-  const root = document.documentElement;
-  if (!document.startViewTransition || still()) return change();
-  root.dataset.nav = dir;
-  document.startViewTransition(change).finished.finally(() => delete root.dataset.nav);
+  change();
+  if (!still()) $("main").animate([{ opacity: 0, transform: `translateX(${dir === "push" ? 32 : -32}px)` }, { opacity: 1, transform: "none" }], { duration: 280, easing: DRAWER });
 }
 function go(screen) {
   top().y = scrollY;
+  setMenu(null, true);
   navigate("push", () => { stack.push(screen); render(); scrollTo(0, 0); });
 }
-function back() {
+function back(animate = true) {
   if (stack.length < 2) return;
-  setContents(false);
-  navigate("pop", () => { stack.pop(); render(); scrollTo(0, top().y ?? 0); });
+  setMenu(null, true);
+  const pop = () => { stack.pop(); render(); scrollTo(0, top().y ?? 0); };
+  animate ? navigate("pop", pop) : pop();
 }
 
+/** Edge swipe-back on Study's pushed screens (Focus prototype): a pointer down within 20 px of the left edge, 8 px of
+ *  hysteresis, then the page follows 1:1 over the screen it came from (drawn underneath, 30% parallax, dimmed). It pops past
+ *  35% of the width or at a flick over .3 px/ms, and snaps back otherwise. */
+function edgeSwipe() {
+  let s = null, under = null;
+  const parentHtml = () => { // the screen underneath, drawn without touching what the bar shows for this one
+    const keep = [screenSections, screenMore], html = screenHtml(stack.at(-2), todayString());
+    [screenSections, screenMore] = keep;
+    return html;
+  };
+  const fading = () => ["bar-title", "contents", "more"].map($); // the bar's title and right-hand circles fade as the page leaves
+  const move = (dx) => {
+    const f = Math.min(1, Math.max(0, dx) / innerWidth), x = dx < 0 ? -rubber(-dx, 80) : dx; // rubber-band past the start
+    $("main").style.transform = `translate3d(${x}px,0,0)`;
+    for (const el of fading()) el.style.opacity = (1 - f).toFixed(3);
+    under.firstElementChild.style.transform = `translate3d(${(-30 + 30 * f).toFixed(2)}%,${-(stack.at(-2).y ?? 0)}px,0)`;
+    under.style.setProperty("--dim", (1 - f).toFixed(3));
+  };
+  document.addEventListener("pointerdown", (e) => {
+    if (s || e.clientX > 20 || e.button > 0 || tab !== "study" || stack.length < 2 || reviewing || document.querySelector("dialog[open]")) return;
+    s = { id: e.pointerId, x: e.clientX, y: e.clientY, on: false, hist: [] };
+  }, true);
+  document.addEventListener("pointermove", (e) => {
+    if (!s || e.pointerId !== s.id) return;
+    const dx = e.clientX - s.x, dy = e.clientY - s.y;
+    if (!s.on) {
+      if (Math.abs(dy) > 10 && Math.abs(dy) > dx) { s = null; return; }
+      if (dx < 8) return;
+      s.on = true; s.x += 8;
+      setMenu(null, true);
+      under = Object.assign(document.createElement("div"), { className: "under", innerHTML: `<div><section class="page">${parentHtml()}</section></div>` });
+      document.body.prepend(under);
+      $("main").classList.add("swiping");
+      document.documentElement.classList.remove("sec");
+    }
+    s.hist.push([e.timeStamp, e.clientX]); while (s.hist.length > 2 && e.timeStamp - s.hist[0][0] > 100) s.hist.shift();
+    move(e.clientX - s.x);
+  }, true);
+  const up = (e) => {
+    if (!s || e.pointerId !== s.id) return;
+    const { on, hist: h } = s, dx = Math.max(0, e.clientX - s.x);
+    s = null;
+    if (!on) return;
+    suppressClick = Date.now() + 350;
+    const v = h.length > 1 ? (h.at(-1)[1] - h[0][1]) / Math.max(1, h.at(-1)[0] - h[0][0]) : 0;
+    const commit = e.type !== "pointercancel" && (dx > innerWidth * .35 || v > .3), main = $("main"), u = under;
+    under = null;
+    const done = () => {
+      main.classList.remove("swiping"); main.style.transform = ""; u.remove();
+      for (const el of fading()) el.style.opacity = "";
+      if (commit) { back(false); requestAnimationFrame(() => scrollTo(0, top().y ?? 0)); } // the parent's scroll, after the swipe's layout settles
+      else updateSection();
+    };
+    if (still()) return done();
+    const a = main.animate([{ transform: `translate3d(${dx}px,0,0)` }, { transform: `translate3d(${commit ? innerWidth : 0}px,0,0)` }], { duration: commit ? 200 : 240, easing: DRAWER, fill: "forwards" });
+    u.firstElementChild.animate([{ transform: u.firstElementChild.style.transform }, { transform: `translate3d(${commit ? 0 : -30}%,${-(stack.at(-2).y ?? 0)}px,0)` }], { duration: commit ? 200 : 240, easing: DRAWER, fill: "forwards" });
+    a.onfinish = () => { done(); a.cancel(); };
+  };
+  document.addEventListener("pointerup", up, true); document.addEventListener("pointercancel", up, true);
+}
+
+const screenHtml = (sc, today) => sc.s === "module" ? moduleScreen(sc.m, today) : sc.s === "lecture" ? lectureScreen(sc.id, today)
+  : sc.s === "note" ? noteScreen(sc.id) : sc.s === "practice" ? practiceScreen(sc) : homeScreen(today);
 function renderStudy(today) {
   const sc = top();
-  screenSections = []; // the lecture and note screens fill it
-  const html = !loaded ? head("Study") + SKELETON : sc.s === "module" ? moduleScreen(sc.m, today) : sc.s === "lecture" ? lectureScreen(sc.id, today)
-    : sc.s === "note" ? noteScreen(sc.id) : sc.s === "practice" ? practiceScreen(sc) : homeScreen(today);
+  screenSections = []; screenMore = null; // the lecture and note screens fill them
+  const html = !loaded ? head("Study") + SKELETON : screenHtml(sc, today);
   if ($("study")._html === html) return; // nothing new: leave the page alone, so typing, focus and open menus survive
   const a = document.activeElement, docOf = (el) => `[data-doc="${CSS.escape(el.closest("[data-doc]")?.dataset.doc ?? "")}"] `;
   const refocus = a?.dataset?.draft != null ? `[data-draft="${CSS.escape(a.dataset.draft)}"]`
@@ -1239,22 +1528,19 @@ function renderStudy(today) {
 function homeScreen(today) {
   const n = due(cards, today).length, open = practice.filter((q) => !q.user_data?.attempt).length;
   let html = head("Study", !n && cards.length ? caughtUp(nextDue(cards, today)) : "") + notices();
-  if (n) html += `<button class="btn primary mt-20" type="button" data-act="review">Review ${plural(n, "card")}</button>`;
-  if (practice.length) {
-    html += `<ul class="group mt-20">${row({ tag: "button", attrs: `data-practice=""`, lead: ICON.practice, title: open ? plural(open, "practice question") : "All practice attempted", chev: true })}</ul>`;
-  }
+  if (n) html += `<button class="btn primary mt-20" type="button" data-act="review">${n > CAP ? `Review ${CAP} of ${num(n)}` : `Review ${plural(n, "card")}`}</button>`;
+  if (practice.length) html += `<ul class="list bare${n ? " mt-12" : " mt-20"}">${row({ tag: "button", attrs: `data-practice=""`, lead: ICON.practice, title: "Practice",
+    trail: open ? num(open) : "", chev: true })}</ul>`;
   if (!modules.length) return html + empty(ICON.books, "No modules yet", "Modules, lecture notes and flashcards arrive after the next lecture sync on the Mac.");
-  return html + `<h2 class="section">Modules</h2><ul class="group flat">${modules.map((m) => {
-    const name = moduleName(m), lecs = lectures.filter((l) => l.module === name).length, d = dueFor(name).length;
-    return row({ tag: "button", attrs: `data-module="${esc(name)}"`, title: esc(name), sub: esc([plural(lecs, "lecture"), d && `${d} due`, prepLine(name)].filter(Boolean).join(" · ")), chev: true });
-  }).join("")}</ul>`;
-}
-
-/** "Prep 2 of 6": the tick list of the module's next brief, "" when it has none. */
-function prepLine(name) {
-  const b = nextBrief([...noteById.values()].filter((x) => x.module === name));
-  const items = (Array.isArray(b?.data?.doc?.blocks) ? b.data.doc.blocks : []).filter((x) => x?.t === "checklist").flatMap((x) => (Array.isArray(x.items) ? x.items : []));
-  return items.length ? `Prep ${items.filter((x) => b.user_data?.checks?.[x.id] === true).length} of ${items.length}` : "";
+  const next = (name) => lectures.filter((l) => l.module === name && (lectureDay(l) ?? "").slice(0, 10) >= today).sort((a, b) => (a.date < b.date ? -1 : 1))[0];
+  const line = (m) => {
+    const name = moduleName(m), l = next(name), d = dueFor(name).length;
+    return [l ? `Next: ${l.data?.n ?? "class"} ${dayLabel(lectureDay(l))}` : m.data?.next ? `Next: ${String(m.data.next).split(" · ")[0]}` : "", d && plural(d, "card")].filter(Boolean).join(" · ") || m.data?.code || "";
+  };
+  // Soonest class first; modules with none keep their order at the end.
+  const order = [...modules].sort((a, b) => (lectureDay(next(moduleName(a)) ?? {}) ?? "9999").localeCompare(lectureDay(next(moduleName(b)) ?? {}) ?? "9999"));
+  return html + `<p class="caption-h">Modules</p><ul class="group flat">${order.map((m) =>
+    row({ tag: "button", attrs: `data-module="${esc(moduleName(m))}"`, title: esc(moduleName(m)), sub: esc(line(m)), chev: true })).join("")}</ul>`;
 }
 
 function moduleScreen(name, today) {
@@ -1267,32 +1553,32 @@ function moduleScreen(name, today) {
   const more = [...noteById.values()].filter((x) => x.module === name && !["readings", "map"].includes(x.data?.kind) && !linked.has(x.id) && !covered.has(String(x.data?.lecture ?? "").toUpperCase()));
   const map = [...noteById.values()].find((x) => x.module === name && x.data?.kind === "map"); // StudyModel.moduleMap
   const coming = lecs.filter((l) => (lectureDay(l) ?? "").slice(0, 10) >= today).sort((a, b) => (a.date < b.date ? -1 : 1))[0];
-  const by = [d.convenor, d.code].filter(Boolean).join(" · ");
-  const info = [...assessmentRows(d.assessment).map((a) => row({ lead: ICON.cap, title: esc(a.title), sub: esc(a.sub) })),
-    coming && row({ lead: ICON.calendar, title: esc([coming.data?.n, coming.data?.topic].filter(Boolean).join(" · ")), sub: esc("Next lecture, " + dayLabel(coming.date)) }),
-    by && row({ lead: ICON.person, title: esc(by) })].filter(Boolean);
-  let html = head(short(name), name !== short(name) ? name : "");
-  if (dueHere.length) html += `<button class="btn primary mt-20" type="button" data-act="review" data-m="${esc(name)}">Review ${plural(dueHere.length, "card")}</button>`;
+  const info = [name.length > 48 && row({ lead: ICON.books, title: esc(name), cls: "wrap" }), // the title clamps at 2 lines: the full name here
+    ...assessmentRows(d.assessment).map((a) => row({ lead: ICON.cap, title: esc(a.title), sub: esc(a.sub), cls: "wrap" })),
+    coming && row({ lead: ICON.calendar, title: esc([coming.data?.n, coming.data?.topic].filter(Boolean).join(" · ")), sub: esc("Next class, " + dayLabel(lectureDay(coming))), cls: "wrap" }),
+    d.convenor && row({ lead: ICON.person, title: esc(d.convenor) })].filter(Boolean);
+  let html = `<h1 class="large clamp${name.length > 60 ? " long" : name.length > 24 ? " mid" : ""}">${esc(name)}</h1>${d.code ? `<p class="sub">${esc(d.code)}</p>` : ""}`;
+  if (dueHere.length) html += `<button class="btn primary mt-20" type="button" data-act="review" data-m="${esc(name)}">Review ${num(Math.min(dueHere.length, CAP))} ${Math.min(dueHere.length, CAP) === 1 ? "card" : "cards"}</button>`;
   else if (deck.length) html += `<p class="foot mt-12">${esc(caughtUp(nextDue(deck, today)))}</p>`;
-  if (info.length) html += `<ul class="group info mt-20">${info.join("")}</ul>`;
-  if (map) html += `<ul class="group flat mt-20">${row({ tag: "button", attrs: `data-note="${esc(map.id)}"`, lead: ICON.map, title: "Module map", chev: true })}</ul>`;
-  html += `<h2 class="section">Lectures</h2>` + (lecs.length ? `<ul class="group flat">${lecs.map((l) => {
-    const postId = l.data?.post || l.user_data?.builtPost, fromSlides = noteById.get(postId)?.data?.from === "slides", day = lectureDay(l);
-    const sub = [l.data?.n, day && dayName(day.slice(0, 10)), l.data?.pre && "Primer", postId && (fromSlides ? "Notes from slides" : "Notes")].filter(Boolean).join(" · ");
-    return row({ tag: "button", attrs: `data-lecture="${esc(l.id)}"`, title: esc(l.data?.topic ?? l.title ?? "Lecture"), sub: esc(sub), chev: true });
+  if (info.length || map) html += `<ul class="group info mt-20">${info.join("")}${map ? row({ tag: "button", attrs: `data-note="${esc(map.id)}"`, lead: ICON.map, title: "Module map", chev: true }) : ""}</ul>`;
+  html += `<p class="caption-h">Lectures</p>` + (lecs.length ? `<ul class="group flat">${lecs.map((l) => {
+    const day = lectureDay(l), notes = !!(l.data?.post || l.user_data?.builtPost);
+    return row({ tag: "button", attrs: `data-lecture="${esc(l.id)}"`, title: esc(l.data?.topic ?? l.title ?? "Lecture"), titleCls: "clamp", sub: esc([l.data?.n, day && dayName(day.slice(0, 10))].filter(Boolean).join(" · ")),
+      trail: notes ? `<span class="sr">Notes</span>${ICON.doc}` : "", trailCls: "glyph-trail", chev: true });
   }).join("")}</ul>` : `<p class="note-line">Lectures appear here as Moodle posts their slides and recordings.</p>`);
-  if (more.length) html += `<h2 class="section">More notes</h2><ul class="group flat">${more.map((x) => row({ tag: "button", attrs: `data-note="${esc(x.id)}"`,
+  if (more.length) html += `<p class="caption-h">More notes</p><ul class="group flat">${more.map((x) => row({ tag: "button", attrs: `data-note="${esc(x.id)}"`,
     title: esc(x.title ?? x.data?.topic ?? "Lecture notes"), sub: x.date ? esc(dayName(x.date.slice(0, 10))) : "", chev: true })).join("")}</ul>`;
-  if (qs.length) html += `<h2 class="section">Practice</h2><ul class="group flat">${qs.map((q) => row({ tag: "button", attrs: `data-practice="${esc(name)}"`,
+  if (qs.length) html += `<p class="caption-h">Practice</p><ul class="group flat">${qs.map((q) => row({ tag: "button", attrs: `data-practice="${esc(name)}"`,
     title: esc(q.data?.prompt ?? q.title ?? ""), titleCls: "clamp", sub: esc([q.data?.lecture, KINDS[q.data?.kind], q.user_data?.attempt && "Tried"].filter(Boolean).join(" · ")), chev: true })).join("")}</ul>`;
   return html;
 }
 
-/** A module's one-line assessment as rows. "Exam, 2 hours, 100%, 2 essays from 6, January" → "Exam · January" over
+/** A module's one-line assessment as rows, split on a comma and a space only, so "2,000 words" stays whole.
+ *  "Exam, 2 hours, 100%, 2 essays from 6, January" → "Exam · January" over
  *  "2 hours · 100% · answer 2 of 6"; anything else ("Group video 30% due 10 Dec · case study …") one row per part, as written. */
 function assessmentRows(text) {
   if (typeof text !== "string" || !text.trim()) return [];
-  const parts = text.split(/\s*,\s*/).filter(Boolean), cap = (t) => t.slice(0, 1).toUpperCase() + t.slice(1);
+  const parts = text.split(/\s*,\s+/).filter(Boolean), cap = (t) => t.slice(0, 1).toUpperCase() + t.slice(1);
   if (parts.length < 3) return text.split(/\s+·\s+/).map((p) => ({ title: cap(p), sub: "" }));
   const month = parts.slice(1).find((p) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*$/i.test(p));
   return [{ title: [parts[0], month].filter(Boolean).join(" · "),
@@ -1308,19 +1594,52 @@ function noteHtml(note, sections) {
 }
 /** The reader's state for a note: revealed answers, tapped-open boxes, each steps block's frame, and re-ask mode. */
 const foldsFor = (id) => { if (!folds.has(id)) folds.set(id, { open: new Set(), shown: new Set(), frames: new Map(), reask: false }); return folds.get(id); };
+const docTitle = (n) => (Array.isArray(n?.data?.doc?.blocks) ? n.data.doc.blocks : []).find((b) => b?.t === "h1" && b.text)?.text ?? null;
 
-/** The Google Doc, when there is one. The note's sections go to the bar's Contents button (`contentsFor`). */
-let screenSections = [];
-function toolbar(sections, url, more = "") {
-  screenSections = sections;
-  const docs = typeof url === "string" && url.startsWith("https://");
-  return docs || more ? `<div class="toolbar">${docs ? `<a class="btn secondary small" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Google Docs</a>` : ""}${more}</div>` : "";
+// ---------- The reader's bar: Contents (its h2s, the current one ticked) and ••• (Open in Google Docs, Note for this class) ----------
+
+let screenSections = [], screenMore = null; // set by the lecture and note screens as they draw
+let menuFor = null;                          // "contents" | "more" | null: the popover that's open
+function setMenu(kind, now = false) {
+  const menu = $("contents-menu"), was = menuFor;
+  for (const id of ["contents", "more"]) $(id).setAttribute("aria-expanded", String(kind === id));
+  menuFor = kind;
+  if (!kind) {
+    if (!was || menu.hidden) return;
+    if (menu.contains(document.activeElement)) $(was).focus({ preventScroll: true }); // focus goes back to its trigger
+    if (now || still()) { menu.hidden = true; return; }
+    menu.classList.add("out");
+    menu.addEventListener("animationend", () => { if (!menuFor) menu.hidden = true; menu.classList.remove("out"); }, { once: true });
+    return;
+  }
+  const cur = currentSection()?.id, m = screenMore;
+  menu.innerHTML = kind === "contents"
+    ? screenSections.map((x) => `<li${x.id === cur ? ` class="cur"` : ""}><button type="button" data-jump="${x.id}">${ICON.tickMark}<span class="lbl">${esc(x.title)}</span></button></li>`).join("")
+    : [m?.url && `<li><a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer" data-act="docs">${ICON.open}<span class="lbl">Open in Google Docs</span></a></li>`,
+       m?.module && `<li><button type="button" data-act="note-class" data-m="${esc(m.module)}" data-l="${esc(m.lecture ?? "")}">${ICON.note}<span class="lbl">Note for this class</span></button></li>`].filter(Boolean).join("");
+  menu.dataset.kind = kind;
+  const r = $(kind).getBoundingClientRect();
+  menu.style.right = `${Math.max(8, innerWidth - r.right + 4)}px`; // scales from its trigger
+  menu.classList.remove("out");
+  menu.hidden = false;
+  menu.querySelector(".cur")?.scrollIntoView({ block: "nearest" });
+  (menu.querySelector(".cur button") ?? menu.querySelector("button, a"))?.focus({ preventScroll: true });
 }
-function setContents(open) {
-  const menu = $("contents-menu");
-  if (open) menu.innerHTML = screenSections.map((x) => `<li><button type="button" data-jump="${x.id}">${esc(x.title)}</button></li>`).join("");
-  menu.hidden = !open;
-  $("contents").setAttribute("aria-expanded", String(open));
+/** The section being read: the last h2 above the bar's bottom edge. */
+function currentSection() {
+  const line = $("bar").offsetHeight + 60; // a jump lands its h2 at the bar + 40 (scroll-margin)
+  let cur = null;
+  for (const x of screenSections) { const el = document.getElementById(x.id); if (el && el.getBoundingClientRect().top < line) cur = x; }
+  return cur;
+}
+/** The sticky caption under the bar names the current section once one has scrolled under it. */
+function updateSection() {
+  const x = tab === "study" && stack.length > 1 && !reviewing && screenSections.length ? currentSection() : null;
+  const edge = $("bar").offsetHeight + 28, doc = $("study").querySelector(".prose[data-doc]");
+  // Only once its h2 has gone under the caption (no twin right below it), and not past the end of the notes.
+  const show = !!x && document.getElementById(x.id).getBoundingClientRect().bottom <= edge && (doc?.getBoundingClientRect().bottom ?? 0) > edge;
+  document.documentElement.classList.toggle("sec", show);
+  if (show) $("bar-sec").textContent = x.title;
 }
 
 function lectureScreen(id, today) {
@@ -1334,26 +1653,29 @@ function lectureScreen(id, today) {
   const qs = practice.filter((q) => q.module === lec.module && q.data?.lecture === n);
   const sections = [], body = note ? noteHtml(note, sections) : "";
   const day = lectureDay(lec), over = !day || day.slice(0, 10) < today; // ponytail: the day, not the timetable's end time as on the Mac
+  screenSections = sections;
+  screenMore = { url: typeof url === "string" && url.startsWith("https://") ? url : null, module: lec.module, lecture: n };
+  const slides = note?.data?.kind === "post" && note.data.from === "slides" && !body.includes(`class="provenance"`);
   return `${head(lec.data?.topic ?? lec.title ?? "Lecture", [short(lec.module), n, day && shortDay(day.slice(0, 10))].filter(Boolean).join(" · "))}
     ${pre && post ? `<div class="seg" role="tablist" aria-label="Which note" style="--n: 2; --i: ${usePrimer ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["Primer", true], ["Notes", false]]
       .map(([label, v]) => `<button type="button" role="tab" data-primer="${v}" aria-selected="${usePrimer === v}">${label}</button>`).join("")}</div>` : ""}
-    ${toolbar(sections, url, `<button class="btn secondary small" type="button" data-act="note-class" data-m="${esc(lec.module)}" data-l="${esc(n)}">Note for this class</button>`)}
-    ${note?.data?.kind === "post" && note.data.from === "slides" ? `<p class="note-line">Built from the slides. Sidebrain rebuilds these notes when the recording’s transcript arrives.</p>` : ""}
     ${body || (over ? empty(ICON.doc, "No notes yet", "Build the notes from the recording in Sidebrain on the Mac.")
                     : empty(ICON.doc, "Notes come after the lecture", "They arrive here once it has finished."))}
-    ${readings?.data?.body ? `<h2 class="section">Readings</h2><div class="prose boxed">${markdown(readings.data.body)}</div>` : ""}
-    ${deck.length ? `<h2 class="section">Flashcards</h2>
-      ${dueHere.length ? `<button class="btn primary" type="button" data-act="review" data-m="${esc(lec.module)}" data-l="${esc(n)}">Review ${plural(dueHere.length, "card")}</button>` : ""}
+    ${slides ? `<p class="provenance">Built from the slides. Sidebrain rebuilds these notes when the recording’s transcript arrives.</p>` : ""}
+    ${readings?.data?.body ? `<p class="caption-h">Readings</p><div class="prose boxed">${markdown(readings.data.body)}</div>` : ""}
+    ${deck.length ? `<p class="caption-h">Flashcards</p>
+      ${dueHere.length ? `<button class="btn primary" type="button" data-act="review" data-m="${esc(lec.module)}" data-l="${esc(n)}">Review ${num(Math.min(dueHere.length, CAP))} ${Math.min(dueHere.length, CAP) === 1 ? "card" : "cards"}</button>` : ""}
       <ul class="group flat${dueHere.length ? " mt-12" : ""}">${deck.map((c) => row({ title: esc(c.data?.front ?? c.title ?? "") })).join("")}</ul>` : ""}
-    ${qs.length ? `<h2 class="section">Practice</h2>${qs.map((q) => practiceCard(q)).join("")}` : ""}`;
+    ${qs.length ? `<p class="caption-h">Practice</p>${qs.map((q) => practiceCard(q)).join("")}` : ""}`;
 }
 
 function noteScreen(id) {
   const note = noteById.get(id);
   if (!note) return head("Notes") + empty(ICON.doc, "Notes not found", "The last sync may have removed them.");
-  const sections = [], body = noteHtml(note, sections);
-  const title = (Array.isArray(note.data?.doc?.blocks) ? note.data.doc.blocks : []).find((b) => b?.t === "h1" && b.text)?.text;
-  return head(title ?? note.title ?? "Lecture notes") + toolbar(sections, note.data?.docUrl) + (body || empty(ICON.doc, "Nothing in these notes", "They may still be building on the Mac."));
+  const sections = [], body = noteHtml(note, sections), url = note.data?.docUrl;
+  screenSections = sections;
+  screenMore = typeof url === "string" && url.startsWith("https://") ? { url } : null;
+  return head(docTitle(note) ?? note.title ?? (note.data?.kind === "map" ? "Module map" : "Lecture notes")) + (body || empty(ICON.doc, "Nothing in these notes", "They may still be building on the Mac."));
 }
 
 function practiceScreen(sc) {
@@ -1365,7 +1687,7 @@ function practiceScreen(sc) {
     : empty(ICON.practice, "No practice yet", "Practice questions come with each lecture’s notes.")}</div>`;
 }
 
-/** Attempt first: the model answer stays locked until something is written, or "Skip to answer" is tapped. */
+/** Attempt first: the model answer stays locked until something is written and checked, or the answer is asked for. */
 function practiceCard(q, withModule = false) {
   const id = q.id, open = shown.has(id) || !!q.user_data?.attempt, model = typeof q.data?.model === "string" ? q.data.model : "";
   const meta = [withModule && short(q.module), q.data?.lecture, KINDS[q.data?.kind] ?? "Question", q.user_data?.attempt && "Tried"].filter(Boolean).join(" · ");
@@ -1374,10 +1696,10 @@ function practiceCard(q, withModule = false) {
     <p class="headline">${esc(q.data?.prompt ?? q.title ?? "")}</p>
     <textarea data-draft="${esc(id)}" rows="4" placeholder="Answer" aria-label="Answer"></textarea>
     <div class="actions">
-      <button class="btn secondary" type="button" data-check="${esc(id)}" disabled>${open ? "Save attempt" : "Show model answer"}</button>
-      ${open ? "" : `<button class="btn plain" type="button" data-skip="${esc(id)}">Skip</button>`}
+      <button class="btn secondary small" type="button" data-check="${esc(id)}" disabled>${open ? "Save attempt" : "Check"}</button>
+      ${open ? "" : `<button class="btn plain" type="button" data-skip="${esc(id)}">Show the answer</button>`}
     </div>
-    ${open ? `<div class="model"><div class="prose tight">${markdown(model)}</div>${q.data?.origin ? `<p class="foot">${esc(q.data.origin)}</p>` : ""}</div>` : ""}
+    ${open ? `<div class="model"><p class="cap">Model answer</p><div class="prose tight">${markdown(model)}</div>${q.data?.origin ? `<p class="foot">${esc(q.data.origin)}</p>` : ""}</div>` : ""}
   </article>`;
 }
 
@@ -1395,46 +1717,258 @@ function syncCheck(box) {
 // ---------- Account sheet ----------
 
 function renderSheet() {
-  const waiting = outbox.length, note = reminderError || REMINDER_NOTE[reminders] || "";
+  // The switch is the master push switch: every ping and the daily summary. Quiet hours and the summary time are the server's.
+  const waiting = outbox.length, note = reminderError || (reminders === "on" ? "On · quiet 22:00–08:00, summary at 08:00" : reminders === "off" ? "Off" : REMINDER_NOTE[reminders] ?? "");
+  const t = theme(), looks = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
   paint($("sheet-body"), `<ul class="group">${row({ lead: `<span class="avatar-lg">${esc((user?.email || "?")[0].toUpperCase())}</span>`,
       title: esc(DEMO ? "Demo" : user?.email ?? ""), sub: DEMO ? "Sample data, kept on this phone" : "Signed in with Google" })}</ul>
+    <ul class="group"><li><div class="row">${ICON.contrast}<span class="text"><span class="title">Appearance</span></span></div>
+      <div class="seg looks" role="radiogroup" aria-label="Appearance" style="--n: 3"><span class="thumb" aria-hidden="true"></span>${looks
+        .map(([k, l]) => `<button type="button" role="radio" data-theme-pick="${k}">${l}</button>`).join("")}</div></li></ul>
     <ul class="group">
-      <li><label class="row">${ICON.bell}<span class="text"><span class="title">Morning reminder</span>${note ? `<span class="subtitle${reminderError ? " warn" : ""}">${esc(note)}</span>` : ""}</span>
-        <input type="checkbox" switch id="remind" ${reminders === "on" ? "checked" : ""} ${["on", "off"].includes(reminders) ? "" : "disabled"} aria-label="Morning reminder"></label></li>
-      <li><label class="row">${ICON.person}<span class="text"><span class="title">Train</span><span class="subtitle">Gym plan, logging, bodyweight and food</span></span>
+      <li><label class="row">${ICON.bell}<span class="text"><span class="title">Notifications</span>${note ? `<span class="subtitle wrap${reminderError ? " warn" : ""}">${esc(note)}</span>` : ""}</span>
+        <input type="checkbox" switch id="remind" ${reminders === "on" ? "checked" : ""} ${["on", "off"].includes(reminders) ? "" : "disabled"} aria-label="Notifications"></label></li>
+      <li><label class="row">${ICON.dumbbell}<span class="text"><span class="title">Train</span><span class="subtitle">Gym plan and logging</span></span>
         <input type="checkbox" switch id="train-on" ${trainOn ? "checked" : ""} aria-label="Train"></label></li>
       ${trainOn ? train.accountRows() : ""}
       ${DEMO ? "" : row({ lead: ICON.sync, title: "Sync", sub: signedOutOfSync && waiting ? `Sign in again to sync ${plural(waiting, "change")}` : "",
         trail: waiting ? `${waiting} waiting` : "Up to date" }).replace('class="subtitle"', 'class="subtitle warn"')}
     </ul>
     <ul class="group flat">${row({ tag: "button", attrs: `data-act="signout"`, title: DEMO ? "Reset demo" : "Sign out", cls: "destructive" })}</ul>`);
+  // The choice is set on the live control, so its thumb slides instead of the group being redrawn.
+  const seg = $("sheet-body").querySelector(".looks");
+  seg.style.setProperty("--i", looks.findIndex(([k]) => k === t));
+  for (const b of seg.querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.themePick === t));
 }
+
+// ---------- Appearance: System, Light or Dark (Account sheet) ----------
+
+const THEME = "sidebrain.theme"; // one per phone, demo or not; index.html applies it before the first paint
+const theme = () => { try { const t = localStorage.getItem(THEME); return t === "light" || t === "dark" ? t : "system"; } catch { return "system"; } };
+function applyTheme(t) {
+  try { if (t === "system") localStorage.removeItem(THEME); else localStorage.setItem(THEME, t); } catch { /* private mode: it lasts until the app closes */ }
+  if (t === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  // The status bar follows: an explicit choice sets both theme-color metas, System gives each its own scheme's colour back.
+  for (const m of document.querySelectorAll("meta[name=theme-color]")) m.content = (t === "system" ? m.media.includes("dark") : t === "dark") ? "#000000" : "#f2f2f7";
+  render();
+}
+
+// ---------- Sheets: open 380 ms, close 220 ms on animationend, drag the head down to dismiss; the confirm action sheet ----------
+
+const DRAWER = "cubic-bezier(.32,.72,0,1)";
+let suppressClick = 0;
+function openSheet(d) {
+  d.classList.remove("closing", "closing-drag");
+  d.getAnimations().forEach((a) => a.cancel());
+  if (!d.open) d.showModal();
+}
+/** Closes with the slide down; `from` is where a drag let go of it, so the close carries on from there. */
+function closeSheet(d, from = null) {
+  if (!d?.open || d.classList.contains("closing") || d.classList.contains("closing-drag")) return;
+  if (from != null && !still()) {
+    d.classList.add("closing-drag");
+    d.animate([{ transform: `translateY(${from}px)` }, { transform: "translateY(calc(100% + 16px))" }], { duration: 220, easing: DRAWER, fill: "forwards" })
+      .onfinish = () => { d.close(); d.getAnimations().forEach((a) => a.cancel()); };
+    return;
+  }
+  d.classList.add("closing");
+  const done = () => { clearTimeout(fallback); d.removeEventListener("animationend", end); if (d.classList.contains("closing")) d.close(); };
+  const end = (e) => { if (e.target === d && (e.animationName === "sheet-out" || e.animationName === "fade-out")) done(); }; // fade-out: Reduce Motion
+  const fallback = setTimeout(done, 300); // in case animationend never comes (a hidden tab)
+  d.addEventListener("animationend", end);
+}
+const rubber = (over, dim, c = .55) => (over * dim * c) / (dim + c * Math.abs(over));
+/** Tap outside, Escape and the drag for one sheet. The drag starts on the grabber or the head: 8 px of hysteresis, then 1:1;
+ *  it dismisses past 25% of the height or at a flick over .11 px/ms, rubber-bands upward, and snaps back otherwise. */
+function sheetGestures(d) {
+  d.addEventListener("cancel", (e) => { e.preventDefault(); closeSheet(d); });
+  d.addEventListener("close", () => d.classList.remove("closing", "closing-drag"));
+  d.addEventListener("click", (e) => {
+    const r = d.getBoundingClientRect();
+    if (e.target === d && (e.clientY < r.top || e.clientY > r.bottom || e.clientX < r.left || e.clientX > r.right)) closeSheet(d);
+  });
+  const head = d.querySelector(".sheet-head");
+  if (!head) return;
+  let g = null;
+  d.addEventListener("pointerdown", (e) => {
+    const r = d.getBoundingClientRect();
+    if (g || e.button > 0 || d.classList.contains("closing") || e.target.closest("input, textarea")) return;
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > head.getBoundingClientRect().bottom) return;
+    g = { id: e.pointerId, y: e.clientY, x: e.clientX, on: false, hist: [[e.timeStamp, e.clientY]] };
+  });
+  d.addEventListener("pointermove", (e) => {
+    if (!g || e.pointerId !== g.id) return;
+    const dy = e.clientY - g.y;
+    if (!g.on) {
+      if (Math.abs(e.clientX - g.x) > 10 && Math.abs(e.clientX - g.x) > Math.abs(dy)) { g = null; return; }
+      if (Math.abs(dy) < 8) return;
+      g.on = true; g.y += Math.sign(dy) * 8; // no jump at the threshold
+      try { d.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
+    }
+    g.hist.push([e.timeStamp, e.clientY]); while (g.hist.length > 2 && e.timeStamp - g.hist[0][0] > 100) g.hist.shift();
+    const y = e.clientY - g.y;
+    d.style.transform = `translateY(${y > 0 ? y : -rubber(-y, 80)}px)`;
+  });
+  const up = (e) => {
+    if (!g || e.pointerId !== g.id) return;
+    const { on, hist: h } = g, y = e.clientY - g.y, v = (h.at(-1)[1] - h[0][1]) / Math.max(1, h.at(-1)[0] - h[0][0]);
+    g = null;
+    if (!on) return;
+    suppressClick = Date.now() + 350;
+    const shown = y > 0 ? y : -rubber(-y, 80);
+    d.style.transform = "";
+    if (e.type !== "pointercancel" && (y > d.offsetHeight * .25 || v > .11)) return closeSheet(d, Math.max(0, shown));
+    if (!still()) d.animate([{ transform: `translateY(${shown}px)` }, { transform: "none" }], { duration: 300, easing: DRAWER });
+  };
+  d.addEventListener("pointerup", up); d.addEventListener("pointercancel", up);
+}
+
+/** The in-app confirm: a message, one destructive action, Cancel. Never confirm(). */
+let asked = null;
+function ask(message, action, then) {
+  say("confirm-msg", message);
+  $("confirm-yes").textContent = action;
+  asked = then;
+  openSheet($("confirm-sheet"));
+}
+
+// ---------- Toast: one line and Undo, 5 s ----------
+
+let toastTimer = 0, toastUndo = null;
+function toast(message, undo = null) {
+  clearTimeout(toastTimer);
+  $("toast-text").textContent = message; toastUndo = undo; $("toast-undo").hidden = !undo;
+  $("toast").classList.add("on");
+  toastTimer = setTimeout(hideToast, 5000);
+}
+function hideToast() { clearTimeout(toastTimer); $("toast").classList.remove("on"); toastUndo = null; }
+
+// ---------- The day sheet: two detents, 1:1 drag, momentum projection, a spring with velocity handoff (Focus prototype) ----------
+
+const daySheet = (() => {
+  const el = $("day"), scrim = $("scrim"), scroller = $("day-scroll");
+  let y = 0, state = "peek", full = 0, peek = 0, raf = 0, dragging = false, startY = 0, sy = 0, hist = [], low = false;
+  const set = (v) => {
+    y = v; el.style.transform = `translate3d(0,${v.toFixed(2)}px,0)`;
+    scrim.style.opacity = Math.min(1, Math.max(0, (peek - v) / Math.max(1, peek - full))).toFixed(3);
+    // A peek that shows only the summary keeps the list hidden until the sheet has moved 40 px.
+    scroller.style.opacity = low ? Math.min(1, Math.max(0, (peek - v) / 40)).toFixed(3) : "";
+  };
+  const setState = (s) => {
+    state = s; el.classList.toggle("peek", s === "peek"); el.classList.toggle("full", s === "full");
+    scrim.classList.toggle("on", s === "full"); $("day-sum").setAttribute("aria-expanded", String(s === "full"));
+    if (s === "peek") scroller.scrollTop = 0;
+    focusable();
+  };
+  // At full the page behind is inert; a peek that shows only the summary keeps its hidden list out of the focus order.
+  const focusable = () => { $("main").inert = $("bar").inert = !el.hidden && state === "full"; scroller.inert = low && state === "peek"; };
+  /** Full sits just under the status bar; the peek never covers the priority, and on a short phone shows only the summary. */
+  function layout() {
+    const dockH = parseFloat(getComputedStyle($("dock")).bottom) + 62;
+    full = (parseFloat(getComputedStyle($("bar")).paddingTop) || 0) + 8;
+    const floor = innerHeight - dockH - 84, content = $("today").querySelector(".prio") ?? $("today").querySelector(".hero");
+    const bottom = content ? content.getBoundingClientRect().bottom + scrollY + 28 : floor;
+    low = floor - bottom < 130;
+    peek = Math.round(low ? floor : Math.max(bottom, innerHeight * .45));
+    document.documentElement.style.setProperty("--full-y", full + "px");
+    if (!dragging && !raf) set(state === "full" ? full : peek);
+    focusable();
+  }
+  /** A damped spring (response .42 s, damping ratio) stepped per frame from the live position and velocity. */
+  function springTo(target, v0 = 0, damping = 1) {
+    cancelAnimationFrame(raf); raf = 0;
+    if (still()) return set(target);
+    const response = .42, k = (2 * Math.PI / response) ** 2, c = 4 * Math.PI * damping / response;
+    let x = y - target, v = v0, last = performance.now();
+    const step = (t) => {
+      const dt = Math.min(.032, (t - last) / 1000); last = t;
+      for (let i = 0; i < 4; i++) { const a = -k * x - c * v; v += a * dt / 4; x += v * dt / 4; }
+      if (Math.abs(x) < .4 && Math.abs(v) < 8) { raf = 0; return set(target); }
+      set(target + x); raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+  }
+  function go(s, v0 = 0, damping = 1) { setState(s); springTo(s === "full" ? full : peek, v0, damping); }
+  const begin = (cy, t) => { cancelAnimationFrame(raf); raf = 0; dragging = true; startY = cy; sy = y; hist = [[t, cy]]; };
+  const track = (cy, t) => {
+    hist.push([t, cy]); while (hist.length > 2 && t - hist[0][0] > 100) hist.shift();
+    let v = sy + (cy - startY);
+    if (v < full) v = full - rubber(full - v, 140); // past full: firm resistance
+    if (v > peek) v = peek + rubber(v - peek, 220);
+    set(v);
+  };
+  const finish = () => {
+    dragging = false;
+    const a = hist[0], b = hist[hist.length - 1], vms = (b[1] - a[1]) / Math.max(1, b[0] - a[0]); // px/ms
+    const projected = y + vms * (.995 / (1 - .995));                                       // Apple's projection, d = .995
+    const target = Math.abs(vms) > .3 ? (vms < 0 ? "full" : "peek") : Math.abs(projected - full) < Math.abs(projected - peek) ? "full" : "peek";
+    go(target, vms * 1000, .86);
+  };
+  // Pointer: the head always, the whole sheet while it peeks. Grabbing it mid-flight stops the spring where it is.
+  let p = null;
+  el.addEventListener("pointerdown", (e) => {
+    if (e.button > 0 || p || (state === "full" && !raf && !e.target.closest(".day-head"))) return;
+    p = { id: e.pointerId, y: e.clientY, on: false };
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!p || e.pointerId !== p.id) return;
+    if (!p.on) { if (Math.abs(e.clientY - p.y) < 6) return; p.on = true; try { el.setPointerCapture(e.pointerId); } catch { /* not capturable */ } begin(e.clientY, e.timeStamp); }
+    track(e.clientY, e.timeStamp);
+  });
+  const up = (e) => {
+    if (!p || e.pointerId !== p.id) return;
+    const on = p.on; p = null;
+    if (on) { suppressClick = Date.now() + 350; finish(); } else if (Math.abs(y - (state === "full" ? full : peek)) > 1) springTo(state === "full" ? full : peek);
+  };
+  el.addEventListener("pointerup", up); el.addEventListener("pointercancel", up);
+  // At full, a pull down on the list from its top hands over to the sheet.
+  let ts = null;
+  scroller.addEventListener("touchstart", (e) => { if (state !== "full" || e.touches.length > 1) return; ts = { y: e.touches[0].clientY, on: false }; }, { passive: true });
+  scroller.addEventListener("touchmove", (e) => {
+    if (!ts) return;
+    const cy = e.touches[0].clientY, dy = cy - ts.y;
+    if (!ts.on) {
+      if (scroller.scrollTop > 0 || dy <= 0) { if (dy < 0) ts = null; return; }
+      if (e.cancelable) e.preventDefault();
+      if (dy < 6) return;
+      ts.on = true; begin(cy, e.timeStamp);
+    }
+    if (e.cancelable) e.preventDefault();
+    track(cy, e.timeStamp);
+  }, { passive: false });
+  scroller.addEventListener("touchend", () => { if (ts?.on) { suppressClick = Date.now() + 350; finish(); } ts = null; });
+  return { layout, go, focusable, get state() { return state; } };
+})();
 
 // ---------- Events ----------
 
 function bind() {
   document.addEventListener("click", (e) => {
-    const t = e.target.closest("[data-act],[data-grade],[data-tab],[data-tick],[data-task],[data-move],[data-letgo],[data-cw],[data-module],[data-lecture],[data-note],[data-practice],[data-primer],[data-check],[data-skip],[data-jump],[data-dg],[data-dg-all],[data-close],[data-mode],[data-remove-photo],"
-      + "[data-open],[data-ping],[data-pmore],[data-snooze],[data-pdone],[data-cl],[data-step],[data-qz],[data-play],[data-ver],[data-speed]");
+    if (reviewing && e.target.closest("#review .flash, #review .review-top, #review .progress") && !e.target.closest("button")) return flip(); // tap anywhere reveals
+    const t = e.target.closest("[data-act],[data-grade],[data-tab],[data-tick],[data-task],[data-move],[data-letgo],[data-module],[data-lecture],[data-note],[data-practice],[data-primer],[data-check],[data-skip],[data-jump],[data-dg],[data-dg-all],[data-close],[data-mode],[data-remove-photo],"
+      + "[data-open],[data-ping],[data-pmore],[data-popen],[data-class],[data-snooze],[data-pdone],[data-cl],[data-step],[data-qz],[data-play],[data-ver],[data-speed],[data-theme-pick]");
     if (!t) return;
     const d = t.dataset;
-    if (d.close != null) return t.closest("dialog").close();
+    if (t.closest("#contents-menu") && !d.jump) setMenu(null, true); // a ••• item: the menu goes as it acts
+    if (d.close != null) return closeSheet(t.closest("dialog"));
     if (d.open) return openTarget(d.open) || tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
     if (d.ping) return openPing(d.ping);
+    if (d.class) { const list = t.closest(".choices")._list ?? []; captureFor = d.class === "none" ? false : list[Number(d.class)] ?? null; classPick = false; render(); return $("add-sheet").querySelector("textarea").focus(); }
     if (d.pmore) return openPingSheet(d.pmore);
-    if (d.snooze) { pingWrite(sheetPing, { snoozedUntil: d.snooze, seenAt: null }); $("ping-sheet").close(); return render(); }
-    if (d.pdone != null) { const done = pings.find((x) => x.id === sheetPing)?.user_data?.done === true;
-      pingWrite(sheetPing, done ? { done: false, doneAt: null } : { done: true, doneAt: Date.now() }); $("ping-sheet").close(); return render(); }
+    if (d.popen != null) { closeSheet($("ping-sheet")); return openPing(sheetPing); }
+    if (d.snooze) { pingWrite(sheetPing, { snoozedUntil: d.snooze, seenAt: null }); closeSheet($("ping-sheet")); return render(); }
+    if (d.pdone != null) { closeSheet($("ping-sheet")); return triage(sheetPing, true); }
     if (d.play) return togglePlay(d.play);
     if (d.ver) { if (player.version !== d.ver || player.id !== t.closest("[data-player]").dataset.player) { stopAudio(); player.id = t.closest("[data-player]").dataset.player; player.version = d.ver; } return render(); }
     if (d.speed != null) { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; keep("speed", speed); audio.playbackRate = speed; return render(); }
     const doc = noteById.get(t.closest("[data-doc]")?.dataset.doc);
     if (doc && d.cl) { const checks = { ...(doc.user_data?.checks ?? {}) }; checks[d.cl] = checks[d.cl] !== true; writeUser(doc, { checks }, "edit"); return render(); }
     if (doc && d.qz) { const [k, j] = d.qz.split(":").map(Number); writeUser(doc, { quiz: { ...(doc.user_data?.quiz ?? {}), [k]: j } }, "edit"); return render(); }
-    if (doc && d.step) { // one frame on, or back; a gentle cross-fade, none under Reduce Motion
+    if (doc && d.step) { // one frame on, or back: only the figure changes, so it just redraws
       const [block, k] = d.step.split(":");
       foldsFor(doc.id).frames.set(block, Number(k));
-      return document.startViewTransition && !still() ? document.startViewTransition(render) : render();
+      return render();
     }
     if (d.grade) return grade(Number(d.grade));
     if (d.tick) return tick(d.tick);
@@ -1443,21 +1977,22 @@ function bind() {
     if (d.letgo != null) return letGo(sheetTask);
     if (d.mode) { setMode(d.mode); return (d.mode === "todo" ? $("todo") : $("add-sheet").querySelector("textarea")).focus(); }
     if (d.removePhoto != null) return setPhoto(t.closest("form"), null);
-    if (d.cw) { datesShown.has(d.cw) ? datesShown.delete(d.cw) : datesShown.add(d.cw); return render(); }
+    if (d.themePick) return applyTheme(d.themePick);
     if (d.tab) return switchTab(d.tab);
     switch (d.act) {
-      case "slipped": openSlipped = !openSlipped; return render();
-      case "all-due": allDue = !allDue; return render();
-      case "all-events": allEvents = !allEvents; return render();
-      case "all-next": allNext = !allNext; return render();
-      case "earlier": openEarlier = !openEarlier; return render();
+      case "fold": return toggleFold(t.closest("[data-fold]"));
+      case "gym": if (!train.openToday?.()) switchTab("train"); return;
       case "add": return openAdd("todo");
-      case "note-class": captureFor = { module: d.m, lecture: d.l || null }; openAdd("note");
-        return say($("add-sheet").querySelector("[data-compose=add] [role=status]"), `For ${[short(d.m), d.l].filter(Boolean).join(" ")}`);
+      case "note-class": captureFor = { module: d.m, lecture: d.l || null }; openAdd("note"); return render();
+      case "class-pick": classPick = !classPick; render(); return $("add-sheet").querySelector("[data-act=class-pick]")?.focus();
+      case "inbox-older": inboxAll = true; return render();
       case "flip": return flip();
       case "review": return openReview(d.m || null, d.l || null);
       case "close-review": return closeReview();
-      case "signout": return signOut();
+      case "review-more": newSession(); return render();
+      case "signout": return ask(DEMO ? "Reset the demo on this phone?" : outbox.length
+        ? `${plural(outbox.length, "change")} ${outbox.length === 1 ? "hasn’t" : "haven’t"} synced yet and will be lost.` : "Sign out of Sidebrain on this phone?",
+        DEMO ? "Reset demo" : "Sign out", signOut);
     }
     if (d.module) return go({ s: "module", m: d.module });
     if (d.lecture) return go({ s: "lecture", id: d.lecture });
@@ -1467,9 +2002,8 @@ function bind() {
     if (d.check) return attempt(d.check);
     if (d.skip) { shown.add(d.skip); return render(); }
     if (d.jump) {
-      setContents(false);
-      const target = document.getElementById(d.jump);
-      return target && scrollTo({ top: target.getBoundingClientRect().top + scrollY - 60, behavior: still() ? "auto" : "smooth" });
+      setMenu(null);
+      return document.getElementById(d.jump)?.scrollIntoView({ block: "start", behavior: still() ? "auto" : "smooth" }); // scroll-margin clears the bar
     }
     if (d.dg != null || d.dgAll != null) { // a blank diagram's box, or its Show all / Hide all
       const state = folds.get(t.closest("[data-doc]")?.dataset.doc), block = d.dg ?? d.dgAll;
@@ -1513,18 +2047,33 @@ function bind() {
   // A date input opens its picker from anywhere on its row (Safari does this; Chrome needs showPicker).
   document.addEventListener("click", (e) => { if (e.target.matches?.("input[type=date].overlay")) try { e.target.showPicker(); } catch { /* not allowed here */ } });
   document.addEventListener("keydown", (e) => {
+    if (menuFor && e.key === "Escape") return setMenu(null);
     if (!reviewing || document.querySelector("dialog[open]") || e.target.matches("textarea, input")) return;
     if (e.key === "Escape") return closeReview();
-    if (e.key === " " && !session.flipped && current()) { e.preventDefault(); flip(); }
-    if (/^[1-4]$/.test(e.key)) grade(Number(e.key) - 1);
+    if (!current() && (e.key === " " || e.key === "Enter")) { e.preventDefault(); return closeReview(); }
+    if (e.key === " ") { e.preventDefault(); return session.flipped ? grade(2) : flip(); } // Space reveals, then answers Good
+    if (e.key === "1" || e.key === "2") grade(e.key === "1" ? 0 : 2);
   });
-  $("account").onclick = () => { reminderError = ""; renderSheet(); $("sheet").showModal(); };
+  $("account").onclick = () => { reminderError = ""; renderSheet(); openSheet($("sheet")); };
   $("back").onclick = back;
-  $("contents").onclick = () => setContents($("contents-menu").hidden);
-  // Contents closes on any tap outside it.
-  document.addEventListener("pointerdown", (e) => { if (!$("contents-menu").hidden && !e.target.closest("#contents-menu, #contents")) setContents(false); });
+  $("contents").onclick = () => setMenu(menuFor === "contents" ? null : "contents");
+  $("more").onclick = () => setMenu(menuFor === "more" ? null : "more");
+  // A popover closes on any tap outside it.
+  document.addEventListener("pointerdown", (e) => { if (menuFor && !e.target.closest("#contents-menu, #contents, #more")) setMenu(null); });
+  let secFrame = 0;
+  addEventListener("scroll", () => { if (screenSections.length && !secFrame) secFrame = requestAnimationFrame(() => { secFrame = 0; updateSection(); }); }, { passive: true });
+  edgeSwipe();
   $("add").onclick = () => openAdd(addMode);
-  for (const dialog of document.querySelectorAll("dialog")) dialog.addEventListener("click", (e) => { if (e.target === dialog) dialog.close(); }); // tap outside closes
+  for (const dialog of document.querySelectorAll("dialog.sheet")) sheetGestures(dialog);
+  $("confirm-yes").onclick = () => { const then = asked; asked = null; closeSheet($("confirm-sheet")); then?.(); };
+  $("toast-undo").onclick = () => { const undo = toastUndo; hideToast(); undo?.(); };
+  $("day-sum").onclick = () => daySheet.go(daySheet.state === "full" ? "peek" : "full");
+  $("scrim").onclick = () => daySheet.go("peek");
+  addEventListener("resize", () => { if (!$("day").hidden) daySheet.layout(); });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => theme() === "system" && applyTheme("system"));
+  document.addEventListener("touchstart", () => {}, { passive: true }); // iOS applies :active only when a touch listener exists
+  // A drag never ends in a tap on what it started on.
+  document.addEventListener("click", (e) => { if (Date.now() < suppressClick) { e.preventDefault(); e.stopPropagation(); } }, true);
   $("todo").addEventListener("input", updateTodo);
   $("todo").addEventListener("scroll", () => { $("todo-mirror").scrollLeft = $("todo").scrollLeft; });
   // Tapping the highlighted date undoes the parse: the phrase stays in the title and no date is set.
@@ -1538,8 +2087,17 @@ function bind() {
     updateTodo();
   });
   $("todo-form").onsubmit = saveTodo;
-  $("add-sheet").addEventListener("close", () => { captureFor = null; if (!$("todo").value.trim()) resetTodo(); });
+  $("add-sheet").addEventListener("close", () => { captureFor = null; classPick = false; renderCaptures(); if (!$("todo").value.trim()) resetTodo(); });
+  // IME: while a composition is open the input draws its own text (the mirror can't see uncommitted text).
+  $("todo").addEventListener("compositionstart", () => $("todo").parentElement.classList.add("composing"));
+  $("todo").addEventListener("compositionend", () => { $("todo").parentElement.classList.remove("composing"); updateTodo(); });
+  document.addEventListener("selectionchange", () => { if (document.activeElement === $("todo")) $("todo-mirror").scrollLeft = $("todo").scrollLeft; });
   $("redirect-signin").onclick = redirectSignIn;
+  $("read-all").onclick = readAll;
+  // The keyboard: iOS standalone doesn't resize the layout viewport, so open sheets are lifted by what it covers (--kb).
+  if (window.visualViewport) { const vv = visualViewport, kb = () => document.documentElement.style.setProperty("--kb", (vv.scale > 1.01 ? 0 : Math.max(0, Math.round(innerHeight - vv.height - vv.offsetTop))) + "px"); // a pinch zoom is not a keyboard
+    vv.addEventListener("resize", kb); vv.addEventListener("scroll", kb); }
+  inboxGestures($("inbox"));
   addEventListener("online", () => { cloud = ""; sb ? refresh() : connect(); });
   if (navigator.serviceWorker) navigator.serviceWorker.onmessage = (e) => {
     if (typeof e.data?.open !== "string") return;
@@ -1555,14 +2113,12 @@ function bind() {
 }
 
 function switchTab(next) {
-  setContents(false);
+  setMenu(null, true);
   tabY[tab] = scrollY;
   if (next === tab && next === "study") { stack = [{ s: "home" }]; tabY.study = 0; } // the current tab again: back to its start
   tab = next;
   render();
-  scrollTo(0, tabY[tab] ?? 0);
-  const page = $(tab);
-  page.classList.remove("enter"); void page.offsetWidth; page.classList.add("enter");
+  scrollTo(0, tabY[tab] ?? 0); // instant, as native tabs are
 }
 
 // ---------- Demo fixtures (?demo=1): sample data dated from now, no network; ?demo=empty starts with nothing ----------
@@ -1579,6 +2135,8 @@ function demoCards() {
     card("sm-l1-1", sm, "L1", "What are the four VRIO questions?", "Is the resource Valuable, Rare, costly to Imitate, and is the firm Organised to capture its value? (Barney, 1991)"),
     card("sm-l1-2", sm, "L1", "Porter’s five forces: name them.", "Rivalry, threat of new entrants, threat of substitutes, buyer power, supplier power."),
     card("sm-l1-3", sm, "L1", "Shareholder primacy versus stakeholder theory?", "Primacy: the firm exists to maximise shareholder value. Stakeholder theory: managers balance the claims of everyone the firm affects.", { due: addDays(t, 3), ease: 2.6, interval: 20, reps: 4, lapses: 0 }),
+    // ?demo=1&many=1: 1,280 more due today, for the session cap of 20 and the number format
+    ...(new URLSearchParams(location.search).has("many") ? Array.from({ length: 1280 }, (_, i) => card(`many-${i}`, sm, "L1", `Sample question ${i + 1}`, "Sample answer.")) : []),
   ];
 }
 
@@ -1613,6 +2171,9 @@ function demoData() {
       event("ev-spin", 6, 45, "Spin class", "Jubilee Sports Centre"),
       { id: "ev-fair", title: "Careers fair week", date: day(-2), data: { title: "Careers fair week", allDay: true, start: `${day(-2)}T00:00:00+01:00`, end: `${day(3)}T00:00:00+01:00` }, user_data: {} }, // began before today, still on
       msClass, // tomorrow 11:00, the brief's class
+      // ?demo=1&classnow=1: a lecture on now, for the hero's On now and Note for this class
+      ...(new URLSearchParams(location.search).has("classnow") ? [{ id: "ev-now", title: "CRG lecture L2: Jensen & Meckling", date: t, data: { title: "CRG lecture L2: Jensen & Meckling",
+        start: new Date(Date.now() - 20 * 6e4).toISOString(), end: new Date(Date.now() + 40 * 6e4).toISOString(), location: "Portland A13" }, user_data: {} }] : []),
     ].filter(Boolean),
     pings: demoPings(),
     assessments: [
@@ -1699,7 +2260,10 @@ function demoPings() {
   const ping = (id, title, when, kind, open, user_data = {}) => ({ id, title, date: localDay(when.getTime()), data: { at: iso(when), kind, open }, user_data });
   const ago = (mins) => new Date(Date.now() - mins * 6e4);
   return [
-    ping("ping-moodle-ms-brief", "M&S: assessment brief posted", ago(95), "moodle", "url:https://moodle.nottingham.ac.uk/"),
+    // One Moodle ping per sync, with counts per module (PingDetect.moodle): the Inbox shows it as one batched row.
+    { ...ping("ping-moodle-sync", "New on Moodle: M&S 2 · CRG 1", ago(95), "moodle", "url:https://moodle.nottingham.ac.uk/"), data: { at: iso(ago(95)), kind: "moodle", open: "url:https://moodle.nottingham.ac.uk/", counts: { "M&S": 2, CRG: 1 } } },
+    ping("ping-moodle-sm-case", "New SM material: Harley case", ago(27 * 60), "moodle", "url:https://moodle.nottingham.ac.uk/", { seenAt: Date.now() - 26 * 36e5 }),
+    ping("ping-deadline-crg-week", "CRG essay due in 8 days", ago(3 * 1440), "deadline", "item:assess-crg-essay", { seenAt: Date.now() - 3 * 864e5 }),
     ping("ping-notes-crg-l1", "CRG L1 notes ready", ago(26 * 60), "notes", "note:auto-post-crg-l1", { seenAt: Date.now() - 25 * 36e5 }),
     ping("ping-deadline-crg-outline", "CRG essay outline due tomorrow", ago(4 * 60), "deadline", "item:assess-crg-essay"),
     ping("ping-brief-ms-sem1", "M&S Seminar 1 brief", at(0, "20:00"), "brief", "note:auto-pre-ms-sem1"),
@@ -1735,7 +2299,7 @@ function demoStudy(t, day) {
     { t: "p", text: "Because monitoring is a *public good*: the monitor pays the full cost and shares the gain with every owner. See [the ECGI primer](https://ecgi.global/) for more." },
     { t: "bullets", items: ["Smith (1776): managers aren’t careful with other people’s money.", "Berle & Means (1932): law separates ownership from control."] },
     { t: "diagram", caption: "**Takeaway:** a claim, two reasons, one objection, then a verdict with a condition.", diagram: debate(false) },
-    { t: "callout", tone: "key", text: "**Check yourself:** why does *more* shareholders make monitoring *less* likely? *Answer in section 4.*" },
+    { t: "callout", tone: "key", text: "✔ **Check yourself:** why does *more* shareholders make monitoring *less* likely? *Answer in section 4.*" },
     { t: "h3", text: "2.2 Where each idea comes from" },
     { t: "diagram", caption: "Quote the year with the name.", diagram: { type: "timeline", title: "The debate over time", events: [
       { label: "1776", text: "Smith: “negligence and profusion”", tone: "plain" }, { label: "1932", text: "Berle & Means: ownership ≠ control", tone: "key" },
@@ -1754,22 +2318,35 @@ function demoStudy(t, day) {
   ] };
   return {
     modules: [
-      { id: "mod-ms", module: "Marketing & Society", title: "Marketing & Society", data: { code: "BUSI3023", short: "M&S", convenor: "Dr Samanthika Gallage", assessment: "Essay 100% due 8 Dec" } },
+      { id: "mod-ms", module: "Marketing & Society", title: "Marketing & Society", data: { code: "BUSI3023", short: "M&S", convenor: "Dr Samanthika Gallage", assessment: "Essay, 2,000 words, 100%, due 8 Dec" } },
       { id: "mod-crg", module: crg, title: crg, data: { code: "BUSI3028", short: "CRG", convenor: "Dr Sarah Lane", assessment: "Exam, 2 hours, 100%, 2 essays from 6, January", next: "L2 Wed 10:00 · Jensen & Meckling model · exam 100%" } },
       { id: "mod-sm", module: sm, title: sm, data: { code: "BUSI3186", short: "SM", convenor: "Dr Tom Hale", assessment: "Group video 30% due 10 Dec · case study 70% due 13 May", next: "L2 Fri 09:00 · External analysis" } },
     ],
     lectures: [
       { id: "lec-marketing-society-sem1", module: "Marketing & Society", date: day(1), title: null, data: { n: "Seminar 1", topic: "The essay brief, the rubric and AI rules", pre: "auto-pre-ms-sem1" }, user_data: {} },
-      { id: "lec-crg-l1", module: crg, date: day(-6), title: null, data: { n: "L1", topic: "Why corporate governance exists", pre: "auto-pre-crg-l1", post: "auto-post-crg-l1" }, user_data: {} },
+      { id: "lec-crg-l1", module: crg, date: day(-6), title: null, data: { n: "L1", topic: "Why corporate governance exists", pre: "auto-pre-crg-l1", post: "auto-post-crg-l1", docUrl: "https://docs.google.com/document/d/demo" }, user_data: {} },
       { id: "lec-crg-l2", module: crg, date: day(1), title: null, data: { n: "L2", topic: "The Jensen & Meckling model", pre: "auto-pre-crg-l2" }, user_data: {} },
       { id: "lec-sm-l1", module: sm, date: day(-4), title: null, data: { n: "L1", topic: "What is strategy?", post: "auto-post-sm-l1" }, user_data: {} },
     ],
     lectureNotes: [
       demoBrief(day),
       note("auto-pre-crg-l1", crg, "pre", "L1", "CRG L1 primer", { body: "Before L1: skim **Berle & Means (1932)**, the abstract only.\n\n- Who owns a listed firm?\n- Who runs it, and why might they differ?" }),
-      note("auto-post-crg-l1", crg, "post", "L1", "CRG L1 · Why corporate governance exists", { body: "## One-page core\nDispersed owners don’t monitor.", doc }),
+      { ...note("auto-post-crg-l1", crg, "post", "L1", "CRG L1 · Why corporate governance exists", { body: "## One-page core\nDispersed owners don’t monitor.", doc }),
+        user_data: { listen: { script: Array(100).fill("Dispersed owners do not monitor managers, so governance closes the gap.").join(" ") } } }, // Listen, made on the Mac
       note("auto-pre-crg-l2", crg, "pre", "L2", "CRG L2 primer", { body: "## Before L2\nThe *Jensen & Meckling (1976)* model is “as hard as it gets”: one graph, no heavy maths.\n\n1. Draw firm value against the manager’s share.\n2. Mark where perks start to cost the owners.\n\n> Read the introduction and conclusion; skip the proofs." }),
       note("auto-post-sm-l1", sm, "post", "L1", "SM L1 · What is strategy?", { body: "## One-page core\n**Strategy** is a set of choices about where to compete and how to win (Porter, 1996).\n\n| Theory | Question it answers | Use it for |\n|---|---|---|\n| Five Forces | How attractive is the industry? | Part 1: why change started |\n| VRIO | Which resources give an edge? | Part 2: what changed |\n| Upper echelons | How do leaders shape it? | Part 3: leadership |\n\n## How to do well\n- Use 2–3 theories **systematically**, not a tour of every model.\n  - Apply each one to the case evidence.\n- Five Forces substitutes are *other products* (trains versus flights).\n\n> Last year’s markers punished describing the case instead of applying theory.\n\n---\nSlides and the brief are on [Moodle](https://moodle.nottingham.ac.uk/)." }),
+      note("auto-map-crg", crg, "map", null, "CRG module map", { doc: { version: 1, blocks: [
+        { t: "h1", text: "CRG module map" },
+        { t: "p", text: "Ten lectures build one argument: who should a company serve, and who makes sure it does? Start at [**L1 · Why governance exists**](note:auto-post-crg-l1)." },
+        { t: "diagram", caption: "**Takeaway:** each class answers the question the last one raised.", diagram: { type: "graph", nodes: [
+          { id: "l1", title: "L1 · Why governance exists", sub: "the agency problem", row: 0 }, { id: "l2", title: "L2 · The Jensen & Meckling model", sub: "what the agency costs", row: 1 },
+          { id: "l3", title: "L3 · Executive pay", sub: "aligning managers", row: 2 }, { id: "l4", title: "L4 · Boards and blockholders", sub: "who watches", row: 3 }],
+          edges: [{ from: "l1", to: "l2", verb: "prices the problem", style: "solid" }, { from: "l2", to: "l3", verb: "one fix", style: "solid" }, { from: "l2", to: "l4", verb: "the other fix", style: "solid" }, { from: "l3", to: "l4", verb: "set by", style: "dashed" }] } },
+        { t: "h2", text: "The classes" },
+        { t: "table", header: ["Class", "Core claim", "Use it for"], rows: [["**L1**", "Dispersed owners don’t monitor, so managers drift.", "Part (a) of any essay"], ["**L2**", "Agency costs are real and can be priced.", "The mechanism"], ["**L3**", "Pay aligns managers only when it tracks their own effort.", "Evaluating a fix"]] },
+        { t: "h2", text: "Essay steer" },
+        { t: "callout", tone: "key", text: "**Exam steer:** pick two lectures and argue between them; don’t tour all ten." },
+      ] } }),
       note("auto-crg-l1-readings", crg, "readings", "L1", "CRG L1 readings", { body: "- **Jensen (2002)**, *Value maximization, stakeholder theory and the corporate objective function*. Essential.\n- Hart & Zingales (2022). Read the abstract, introduction and conclusion." }),
     ],
     practice: [

@@ -10,13 +10,15 @@ export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.char
 export const TICK = `<svg viewBox="0 0 22 22" aria-hidden="true"><circle class="ring" cx="11" cy="11" r="10.25"/><circle class="disc" cx="11" cy="11" r="11"/><path class="check" d="M6.6 11.4l3 3 5.8-6.3" pathLength="1"/></svg>`;
 const str = (x) => (typeof x === "string" ? x : "");
 const arr = (x) => (Array.isArray(x) ? x : []);
+/** A leading ✔ ✓ ✎ ☐ from the generator is dropped (no dingbats in the reader). */
+const undingbat = (t) => String(t ?? "").replace(/^[\s✔✓✎☐✅]+/u, "");
 const WIKI = [[/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2"], [/\[\[([^\]]+)\]\]/g, "$1"]];
 
 /** Inline Markdown as HTML: **bold**, *italic*, `code`, [text](https://…); [[wiki|links]] show their name. A `note:<id>`
  *  link (a module map's classes) opens that note in the app; its href is the app's own ?open= link. */
 export function inline(s) {
   const kept = [], stash = (html) => `\u0000${kept.push(html) - 1}\u0000`;
-  let t = String(s ?? "").replace(/\u0000/g, "");
+  let t = undingbat(String(s ?? "").replace(/\u0000/g, ""));
   for (const [re, to] of WIKI) t = t.replace(re, to);
   t = esc(t)
     .replace(/`([^`]+)`/g, (_, code) => stash(`<code>${code}</code>`))
@@ -31,7 +33,7 @@ export function inline(s) {
 
 /** Inline marks gone, for labels and the Contents list (MarkdownText.inline). Not HTML: escape it where it lands. */
 export function plain(s) {
-  let t = String(s ?? "");
+  let t = undingbat(s);
   for (const [re, to] of [...WIKI, [/!\[([^\]]*)\]\([^)]*\)/g, "$1"], [/\[([^\]]+)\]\([^)]*\)/g, "$1"], [/\*\*|__|~~|`/g, ""],
                           [/(^|[^\w*])\*(\S|\S[^*]*?\S)\*(?![\w*])/g, "$1$2"]]) t = t.replace(re, to);
   return t;
@@ -46,7 +48,11 @@ export function leadIn(text) {
   const body = rest.trim().replace(/^\p{Ll}/u, (c) => c.toUpperCase());
   return `<p class="lead-cap${/^check yourself/i.test(label) ? " accent" : ""}">${inline(label)}</p>${body ? `<p>${inline(body)}</p>` : ""}`;
 }
-const para = (text) => leadIn(text) ?? `<p>${inline(text)}</p>`;
+
+const para = (text) => { const t = undingbat(text); return leadIn(t) ?? `<p>${inline(t)}</p>`; };
+/** "Built from…", "**From slides, no recording.**": how the notes were made. One caption at the very end, not the top. */
+export const isProvenance = (t) => /^[\s*_]*(built from|from (the )?(slides|recording))/i.test(String(t ?? ""));
+const provenance = (t) => `<p class="provenance">${esc(plain(t).replace(/\s*\n\s*/g, " ").replace(/^\s*built from:?\s*/i, "Built from ").trim())}</p>`;
 
 /** An answers callout: "**Answers.** 1 Because… 2 Hidden…" → the label goes and numbered answers become a list. */
 export function answers(text) {
@@ -73,7 +79,7 @@ export function table(header, rows) {
 /** Markdown blocks as HTML. Each line is a block, as on the Mac: headings, bullets (two spaces per level), numbered
  *  items, pipe tables, quotes, rules and paragraphs. With `sections`, h2s get an id and go onto it ({id, title}) for Contents. */
 export function markdown(src, sections = null) {
-  const out = [];
+  const out = [], made = [];
   let open = "", rows = null; // the list or quote being built ("ul" | "ol" | "blockquote"), the table being built
   const close = () => {
     if (rows) { out.push(table(rows[0], rows.slice(1))); rows = null; }
@@ -106,12 +112,14 @@ export function markdown(src, sections = null) {
     } else if (line.startsWith(">")) {
       start("blockquote");
       out.push(`<p>${inline(line.replace(/^(>\s?)+/, ""))}</p>`);
+    } else if (/^\*\*/.test(line) && isProvenance(line)) {
+      close(); made.push(line);
     } else {
       close(); out.push(para(line));
     }
   }
   close();
-  return out.join("");
+  return out.join("") + made.map(provenance).join("");
 }
 
 /** MarkdownText.body: the text without leading YAML front matter. */
@@ -135,9 +143,9 @@ export function isAnswers(callout) {
  *  and `reask` true when opened as a re-ask. */
 export function lectureDoc(json, state = {}, sections = []) {
   if (!json || typeof json !== "object" || Array.isArray(json) || (json.version ?? 1) !== 1 || !Array.isArray(json.blocks)) return null;
-  const n = { quiz: 0, pre: 0 }; // quiz and guess keys count across the whole doc, as on the Mac (LectureDoc.itemStarts)
+  const n = { quiz: 0, pre: 0, made: [] }; // quiz and guess keys count across the whole doc, as on the Mac (LectureDoc.itemStarts)
   const parts = json.blocks.map((b, i) => (b && typeof b === "object" ? block(b, i, state, sections, n) : null));
-  return parts.some((p) => p != null) ? parts.join("") : null;
+  return parts.some((p) => p != null) ? parts.join("") + n.made.map(provenance).join("") : null;
 }
 
 const TEXT = ["h1", "h2", "h3", "p", "meta", "quote", "callout"], LISTS = ["inshort", "bullets", "numbers", "sources"];
@@ -164,6 +172,7 @@ function block(b, i, state, sections, n) {
     case "numbers": return list("ol");
     case "sources": return `<ol class="sources">${items.map((x) => `<li>${inline(x)}</li>`).join("")}</ol>`;
     case "callout": {
+      if ((b.tone ?? "note") === "note" && isProvenance(text)) { n.made.push(text); return ""; }
       const tone = ["key", "warn", "note"].includes(b.tone) ? b.tone : "note";
       if (isAnswers(text)) return `<details class="reveal" data-fold="${i}"${state.open?.has(String(i)) ? " open" : ""}><summary>
         <span>Answers</span><span class="act"><span class="when-closed">Show</span><span class="when-open">Hide</span></span>
@@ -195,14 +204,14 @@ function checklist(b, user) {
   const must = items.filter((x) => x.must === true), left = items.filter((x) => !done(x)).reduce((s, x) => s + (Number(x.minutes) || 0), 0);
   const line = [must.length && `${must.filter(done).length} of ${must.length} must-dos done`, left ? `${prep(left)} left` : items.every(done) ? "All done" : ""].filter(Boolean).join(" · ");
   return `<div class="card checklist">${line ? `<p class="caption">${esc(line)}</p>` : ""}<ul>${items.map((x) => {
-    const meta = [Number(x.minutes) > 0 && prep(Number(x.minutes)), x.must === true && "Must do"].filter(Boolean).join(" · ");
+    const meta = [Number(x.minutes) > 0 && prep(Number(x.minutes)), x.must !== true && "Optional"].filter(Boolean).join(" · ");
     return `<li class="cl${done(x) ? " done" : ""}"><button class="tick" type="button" data-cl="${esc(x.id)}" aria-pressed="${done(x)}" aria-label="${done(x) ? "Undo" : "Done"}: ${esc(plain(x.text))}">${TICK}</button>
       <span class="cl-text"><span>${inline(x.text)}</span>${str(x.detail) ? `<span class="foot">${inline(x.detail)}</span>` : ""}${meta ? `<span class="foot">${meta}</span>` : ""}</span></li>`;
   }).join("")}</ul></div>`;
 }
 
 /** A step-through: one frame at a time with Back and Next. A frame's `focus` nodes are highlighted and the rest dimmed;
- *  a frame's own diagram replaces the shared one. The app swaps frames in a view transition (none under Reduce Motion). */
+ *  a frame's own diagram replaces the shared one. Only the figure changes between frames, so the app just redraws. */
 function steps(b, i, state) {
   const frames = objects(b.frames);
   if (!frames.length) return null;
@@ -210,7 +219,7 @@ function steps(b, i, state) {
   const nav = `<p class="step-text">${inline(str(f.text))}</p><div class="step-nav">
     <button class="btn secondary small back" type="button" data-step="${i}:${k - 1}"${k === 0 ? " disabled" : ""}>Back</button>
     <span class="foot">Step ${k + 1} of ${n}</span>
-    <button class="btn primary small next" type="button" data-step="${i}:${k + 1}"${k === n - 1 ? " disabled" : ""}>Next</button></div>`;
+    <button class="btn secondary small next" type="button" data-step="${i}:${k + 1}"${k === n - 1 ? " disabled" : ""}>Next</button></div>`;
   const d = f.diagram && typeof f.diagram === "object" ? f.diagram : b.diagram;
   const title = str(b.title) || str(d?.title);
   return diagram(d && { ...d, title }, "", i, state, { focus: arr(f.focus), html: nav })
@@ -247,7 +256,7 @@ function marks(b) {
   return `<figure class="card marks">${str(b.title) ? `<p class="strong">${inline(b.title)}</p>` : ""}
     <div aria-hidden="true">${bar("words", "Words")}${bar("weight", "Marks")}</div>
     <ul class="mk-rows">${rows.map((r) => `<li><i class="sw ai-${ai(r)}" aria-hidden="true"></i><span>${inline(r.label)}</span>
-      <span class="foot">${[num(r.words) && `${num(r.words).toLocaleString("en-GB")} words`, num(r.weight) && `${num(r.weight)}%`].filter(Boolean).join(" · ")}<span class="sr">, ${AI[ai(r)]}</span></span></li>`).join("")}</ul>
+      <span class="foot">${[num(r.words) && `${num(r.words).toLocaleString("en-GB")} words`, num(r.weight) && `${num(r.weight)}%`, AI[ai(r)]].filter(Boolean).join(" · ")}</span></li>`).join("")}</ul>
     <p class="mk-legend foot" aria-hidden="true">${used.map((k) => `<span><i class="sw ai-${k}"></i>${AI[k]}</span>`).join("")}</p></figure>`;
 }
 
@@ -260,62 +269,62 @@ function prequestions(b, i, state, n) {
   const guesses = state.user?.guesses && typeof state.user.guesses === "object" ? state.user.guesses : {};
   const guess = (k) => (typeof guesses[at + k] === "string" ? guesses[at + k].trim() : "");
   if (state.reask) {
-    return `<div class="card preq" id="preq-${i}"><p class="strong">Your guesses and the answers</p><ol>${qs.map((x, k) => `<li><p>${inline(x.q)}</p>
+    return `<div class="card preq" id="preq-${i}"><p class="strong">Guesses and answers</p><ol>${qs.map((x, k) => `<li><p>${inline(x.q)}</p>
       <p class="foot">${guess(k) ? `You guessed: ${esc(guess(k))}` : "No guess"}</p><p class="answer">${inline(str(x.answer))}</p></li>`).join("")}</ol></div>`;
   }
-  return `<div class="card preq" id="preq-${i}"><p class="strong">Guess first</p><p class="caption">A guess for each, even a wild one. The class answers them.</p><ol>${qs.map((x, k) =>
-    `<li><label><span>${inline(x.q)}</span><input class="guess" type="text" data-guess="${at + k}" placeholder="Your guess" enterkeyhint="done" autocomplete="off"></label></li>`).join("")}</ol></div>`;
+  return `<div class="card preq" id="preq-${i}"><p class="strong">Guess first</p><ol>${qs.map((x, k) =>
+    `<li><label><span>${inline(x.q)}</span><input class="guess" type="text" data-guess="${at + k}" placeholder="Guess" enterkeyhint="done" autocomplete="off"></label></li>`).join("")}</ol></div>`;
 }
 
 const TONES = ["key", "con", "plain", "verdict"];
 const tone = (t) => (TONES.includes(t) ? t : "plain");
 
-/** A diagram as boxes in their rows (wrapping to fit), with each arrow written out under them ("A supports → B",
- *  dashed = opposing ⇢), or a timeline down the left edge. Blank "complete me" diagrams hide every box not in `keep`
- *  (and its name in the arrows) until it is tapped.
- *  ponytail: no drawn arrows; the Mac's routed graph layout is 400 lines. Port it if the written-out arrows read badly. */
+/** A graph as a numbered vertical sequence: sources first (Kahn's order, ties by row then position), so the arrows run
+ *  downward, each link a connector line with its short verb ("supports 4" when it skips ahead; dashed = against). A
+ *  timeline is a vertical timeline. Blank "complete me" graphs hide every node not in `keep` until it is tapped; a step's
+ *  `focus` nodes are lit and the rest dimmed. */
 function diagram(d, caption, i, state, step = null) {
   if (!d || typeof d !== "object" || (d.type !== "graph" && d.type !== "timeline")) return null;
-  const raw = arr(d.nodes).filter((n) => n && typeof n === "object");
-  // Rows: explicit `row`, else the old x/y layouts clustered (same y within 40 = same row, then by x).
+  const events = arr(d.events).filter((e) => e && typeof e === "object");
+  const raw = arr(d.nodes).filter((n) => n && typeof n === "object" && typeof n.id === "string");
+  if (d.type === "graph" ? !raw.length : !events.length) return null;
+  const lit = (id) => (!step?.focus.length ? "" : step.focus.includes(id) ? " focus" : " dim");
+  const cap = caption ? `<figcaption>${leadIn(caption) ?? inline(caption)}</figcaption>` : "";
+  const head = str(d.title) ? `<p class="strong">${esc(d.title)}</p>` : "";
+  if (d.type === "timeline") {
+    return `<figure class="card diagram${step ? " steps" : ""}">${head}${str(d.note) ? `<p class="caption">${inline(d.note)}</p>` : ""}<ol class="vtl">${events.map((e) =>
+      `<li class="tone-${tone(e.tone)}${lit(e.id ?? e.label)}"><b>${esc(e.label)}</b><span class="dot" aria-hidden="true"></span><span>${esc(e.text)}</span></li>`).join("")}</ol>${cap}${step?.html ?? ""}</figure>`;
+  }
+  // Rows: explicit `row`, else the old x/y layouts clustered (same y within 40 = same row).
   const levels = [];
   for (const y of raw.map((n) => n.y).filter(Number.isFinite).sort((a, b) => a - b)) if (!levels.length || y - levels.at(-1) > 40) levels.push(y);
-  const nodes = raw.map((n, k) => typeof n.id !== "string" ? null : {
-    id: n.id, title: str(n.title), sub: str(n.sub), tone: tone(n.tone), k, x: Number.isFinite(n.x) ? n.x : k,
-    row: Number.isFinite(n.row) ? Math.trunc(n.row) : Number.isFinite(n.y) ? Math.max(0, levels.findLastIndex((l) => l <= n.y)) : 0,
-  }).filter(Boolean).sort((a, b) => a.row - b.row || a.x - b.x || a.k - b.k);
+  const nodes = raw.map((n, k) => ({ id: n.id, title: str(n.title).replace(/^\d+\s*·\s*/, ""), sub: str(n.sub), tone: tone(n.tone),
+    rank: (Number.isFinite(n.row) ? Math.trunc(n.row) : Number.isFinite(n.y) ? Math.max(0, levels.findLastIndex((l) => l <= n.y)) : 0) * 1e7 + (Number.isFinite(n.x) ? n.x : k) * 10 + k / 1e3 }));
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const edges = arr(d.edges).filter((e) => e && byId.has(e.from) && byId.has(e.to));
-  const events = arr(d.events).filter((e) => e && typeof e === "object");
-  if (d.type === "graph" ? !nodes.length : !events.length) return null;
-
-  const keep = arr(d.keep), blank = d.blank === true && d.type === "graph";
-  const blankable = (n) => blank && !keep.includes(n.id);
-  const hidden = (n) => blankable(n) && !state.shown?.has(`${i}:${n.id}`);
-  // A step's focus: its nodes highlighted, the rest dimmed.
-  const lit = (id) => (!step?.focus.length ? "" : step.focus.includes(id) ? " focus" : " dim");
-  let body;
-  if (d.type === "timeline") {
-    body = `<ol class="dg-time">${events.map((e) => `<li class="tone-${tone(e.tone)}${lit(e.id ?? e.label)}"><b>${esc(e.label)}</b><i aria-hidden="true"></i><span>${esc(e.text)}</span></li>`).join("")}</ol>`;
-  } else {
-    const rows = [...new Set(nodes.map((n) => n.row))].map((r) => nodes.filter((n) => n.row === r));
-    // An argument map (any key, con or verdict box) reads by its captions: Claim, For, Against, Verdict. A plain flow keeps its arrows.
-    const argument = nodes.some((n) => n.tone !== "plain");
-    const role = (n) => (n.tone === "key" ? "For" : n.tone === "con" ? "Against" : n.tone === "verdict" ? "Verdict" : n.row === nodes[0].row ? "Claim" : "");
-    const inner = (n) => `<b>${esc(n.title)}</b>${n.sub ? `<small>${esc(n.sub)}</small>` : ""}`;
-    const box = (n) => !blankable(n) ? `<div class="dg-node tone-${n.tone}${lit(n.id)}">${inner(n)}</div>`
-      : `<button type="button" class="dg-node tone-${hidden(n) ? "blank" : n.tone}" data-dg="${i}" data-node="${esc(n.id)}" aria-pressed="${!hidden(n)}"${hidden(n) ? ` aria-label="Blank box"` : ""}>${hidden(n) ? "" : inner(n)}</button>`;
-    const name = (n) => (hidden(n) ? `<span class="blank-name" aria-label="blank">?</span>` : esc(n.title));
-    const groups = argument ? rows.flatMap((row) => [...new Set(row.map(role))].map((r) => [r, row.filter((n) => role(n) === r)])) : rows.map((row) => ["", row]);
-    body = `<div class="dg-rows">${groups.map(([r, row]) => `<div class="dg-group">${r ? `<p class="dg-cap">${r}</p>` : ""}<div class="dg-row">${row.map(box).join("")}</div></div>`).join("")}</div>
-      ${edges.length && !argument ? `<ul class="dg-edges">${edges.map((e) => `<li${e.style === "dashed" ? ` class="against"` : ""}>${name(byId.get(e.from))} <i>${esc(e.verb)}</i> ${e.style === "dashed" ? "⇢" : "→"} ${name(byId.get(e.to))}</li>`).join("")}</ul>` : ""}`;
+  const indeg = new Map(nodes.map((n) => [n.id, 0]));
+  for (const e of edges) indeg.set(e.to, indeg.get(e.to) + 1);
+  const order = [], left = [...nodes].sort((a, b) => a.rank - b.rank);
+  while (left.length) { // a cycle takes the earliest node left
+    const n = left.find((x) => !indeg.get(x.id)) ?? left[0];
+    order.push(n); left.splice(left.indexOf(n), 1);
+    for (const e of edges) if (e.from === n.id) indeg.set(e.to, indeg.get(e.to) - 1);
   }
-  const blanks = nodes.filter(blankable), all = blanks.every((n) => !hidden(n));
-  return `<figure class="card diagram${step ? " steps" : ""}">
-    ${str(d.title) ? `<p class="strong">${esc(d.title)}</p>` : ""}${str(d.note) && d.type !== "graph" ? `<p class="caption">${inline(d.note)}</p>` : ""}
-    ${blank && caption ? `<figcaption class="above">${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}${body}${caption && !blank ? `<figcaption>${leadIn(caption) ?? inline(caption)}</figcaption>` : ""}
-    ${blanks.length ? `<div class="dg-foot"><button type="button" class="link" data-dg-all="${i}">${all ? "Hide all" : "Show all"}</button></div>` : ""}${step?.html ?? ""}
-  </figure>`;
+  const no = new Map(order.map((n, k) => [n.id, k + 1])), keep = arr(d.keep), blank = d.blank === true;
+  const blankable = (n) => blank && !keep.includes(n.id), hidden = (n) => blankable(n) && !state.shown?.has(`${i}:${n.id}`);
+  const inner = (n) => `${n.tone === "verdict" ? `<small class="role">Verdict</small>` : ""}<b>${esc(n.title)}</b>${n.sub ? `<small>${esc(n.sub)}</small>` : ""}`;
+  const items = order.map((n, k) => {
+    const out = edges.filter((e) => e.from === n.id), next = order[k + 1]?.id, joined = out.filter((e) => e.to === next);
+    const verbs = [...joined.map((e) => str(e.verb)), ...out.filter((e) => e.to !== next).map((e) => `${str(e.verb)} → ${no.get(e.to)}`.trim())].filter(Boolean).join(", ");
+    const box = !blankable(n) ? `<span class="b">${inner(n)}</span>`
+      : `<button type="button" class="b${hidden(n) ? " blank" : ""}" data-dg="${i}" data-node="${esc(n.id)}" aria-pressed="${!hidden(n)}"${hidden(n) ? ` aria-label="Reveal box ${k + 1}">Reveal` : `>${inner(n)}`}</button>`;
+    // The line joins a node to the next only when an arrow does; consecutive unlinked nodes get none.
+    const link = k < order.length - 1 && (joined.length || verbs) ? `<span class="link${joined.length ? "" : " skip"}${(joined.length ? joined : out).some((e) => e.style === "dashed") ? " dashed" : ""}"><i aria-hidden="true"></i><span>${esc(verbs)}</span></span>` : "";
+    return `<li class="tone-${n.tone}${lit(n.id)}"><span class="n" aria-hidden="true">${k + 1}</span>${box}${link}</li>`;
+  }).join("");
+  const blanks = order.filter(blankable), all = blanks.every((n) => !hidden(n));
+  return `<figure class="card diagram${step ? " steps" : ""}">${head}${blank ? cap : ""}<ol class="seq">${items}</ol>${blank ? "" : cap}
+    ${blanks.length ? `<div class="dg-foot"><button type="button" class="btn secondary small" data-dg-all="${i}">${all ? "Hide all" : "Show all"}</button></div>` : ""}${step?.html ?? ""}</figure>`;
 }
 
 // ---------- Which notes belong to a lecture (Sources/(C) View Study.swift LectureReader) ----------

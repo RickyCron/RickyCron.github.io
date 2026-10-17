@@ -8,6 +8,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <script>/* Account → Appearance, applied before the first paint (app.js applyTheme does the same on a change) */
+    try { var t = localStorage.getItem("sidebrain.theme"); if (t === "light" || t === "dark") { document.documentElement.dataset.theme = t;
+      for (var m of document.querySelectorAll("meta[name=theme-color]")) m.content = t === "dark" ? "#000000" : "#f2f2f7"; } } catch (e) {}</script>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -24,16 +27,22 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>
     </button>
     <p class="bar-title" id="bar-title" aria-hidden="true"></p>
+    <button class="pill" id="read-all" type="button" hidden>Mark all read</button>
     <button class="circle avatar" id="account" type="button" aria-label="Account" hidden></button>
     <button class="circle" id="contents" type="button" aria-label="Contents" aria-expanded="false" aria-controls="contents-menu" hidden>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 6.5h10M9.5 12h10M9.5 17.5h10"/><circle cx="5" cy="6.5" r=".9"/><circle cx="5" cy="12" r=".9"/><circle cx="5" cy="17.5" r=".9"/></svg>
     </button>
+    <button class="circle" id="more" type="button" aria-label="More" aria-expanded="false" aria-controls="contents-menu" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.1"/><circle cx="12" cy="12" r="1.1"/><circle cx="18" cy="12" r="1.1"/></svg>
+    </button>
+    <p class="bar-sec" id="bar-sec" aria-hidden="true"></p>
   </header>
   <ul class="menu" id="contents-menu" hidden></ul>
 
   <main id="main">
     <section id="signin" class="page" hidden>
-      <h1 class="large">Sidebrain</h1>
+      <img class="app-icon" src="icon.svg" width="64" height="64" alt="">
+      <h1 class="title1">Sidebrain</h1>
       <p class="sub">Use the same Google account as the Mac.</p>
       <div id="gsi"></div>
       <p class="foot" id="signin-status" role="status"></p>
@@ -47,12 +56,16 @@
     <section id="inbox" class="page" hidden></section>
 
     <section id="train" class="page" hidden></section>
-    <section id="capture" class="page" hidden>
-      <h1 class="large">Capture</h1>
-      <form class="compose" data-compose="capture" autocomplete="off"></form>
-      <div id="capture-list"></div>
-    </section>
   </main>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <section class="day peek" id="day" aria-label="The rest of today" hidden>
+    <div class="day-head" id="day-head">
+      <div class="grabber" aria-hidden="true"></div>
+      <button class="day-sum" id="day-sum" type="button" aria-expanded="false"><span id="day-sum-text"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg></button>
+    </div>
+    <div class="day-scroll" id="day-scroll"></div>
+  </section>
 
   <nav class="dock" id="dock" hidden>
     <div class="tabs chrome" id="tabs">
@@ -69,10 +82,6 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.75 13.25l2.6-7.1a1.5 1.5 0 0 1 1.4-.9h8.5a1.5 1.5 0 0 1 1.4.9l2.6 7.1v4.5a1.5 1.5 0 0 1-1.5 1.5H5.25a1.5 1.5 0 0 1-1.5-1.5zM3.75 13.25H8.5l1 2h5l1-2h4.75"/></svg>
         <span>Inbox</span><b class="badge" id="inbox-badge" aria-hidden="true" hidden></b>
       </button>
-      <button type="button" data-tab="capture">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4.75H6.75a2 2 0 0 0-2 2v10.5a2 2 0 0 0 2 2h10.5a2 2 0 0 0 2-2V13"/><path d="M17.6 3.9a1.9 1.9 0 0 1 2.7 2.7L12.5 14.4l-3.35.85.85-3.35z"/></svg>
-        <span>Capture</span>
-      </button>
       <button type="button" data-tab="train" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.25 9.5v5M6.25 7v10M17.75 7v10M20.75 9.5v5M6.25 12h11.5"/></svg>
         <span>Train</span>
@@ -84,6 +93,7 @@
   </nav>
 
   <div class="review" id="review" role="dialog" aria-modal="true" aria-label="Review" hidden></div>
+  <div class="toast chrome" id="toast" role="status" aria-live="polite"><span id="toast-text"></span><button type="button" id="toast-undo">Undo</button></div>
 
   <dialog class="sheet" id="sheet" aria-labelledby="sheet-title">
     <div class="grabber" aria-hidden="true"></div>
@@ -144,9 +154,14 @@
     <ul class="group">
       <li><button class="row" type="button" data-pdone>
         <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.25"/><path d="M8.5 12.25l2.4 2.4 4.6-5"/></svg>
-        <span class="text"><span class="title" id="ping-done-label">Done</span></span>
+        <span class="text"><span class="title" id="ping-done-label">Mark as done</span></span>
       </button></li>
     </ul>
+  </dialog>
+
+  <dialog class="sheet action" id="confirm-sheet" aria-labelledby="confirm-msg">
+    <ul class="group"><li><p class="msg" id="confirm-msg"></p></li><li><button class="row destructive" type="button" id="confirm-yes"></button></li></ul>
+    <ul class="group"><li><button class="row" type="button" data-close>Cancel</button></li></ul>
   </dialog>
 
   <dialog class="sheet" id="task-sheet" aria-labelledby="task-title">

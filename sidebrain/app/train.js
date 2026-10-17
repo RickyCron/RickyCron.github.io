@@ -1,16 +1,16 @@
 // The Train tab: an optional plugin, off until switched on in the Account sheet (docs/(C) Gym plugin research.md §1, §7).
-// It owns #train and #train-sheet (one sheet for every choice: a set, an exercise's menu, swap, finish, discard, bodyweight,
-// food); app.js hands it the outbox, the Supabase client and its row/HTML helpers, and loads `gym` items only while it is on.
-// The rules live in gym.js; this file is screens and writes. No prompt(), confirm() or alert(): every choice is a sheet.
+// Built on the shell's design system (web/(C) Design system.md): the Today-style hero answers "what now?", inset-grouped
+// lists below it, the shell's sheet, Undo toast and folds. It owns #train and #train-sheet (one sheet, one mode at a time:
+// a set, an exercise's menu, swap, another session, finish, bodyweight, food). The rules live in gym.js.
 import { PLAN, KEYS, sessionForDay, sessionsOf, prescribe, warnings, deloadOffer, week, weightTrend, startFrom, e1rm, lastTime,
          planWeek, scaleItem, dayFood, foodRequest, parseFood, whoopFor, PROTEIN_TARGET, phaseOf, exerciseById, FEEL, WRECKED } from "./gym.js";
 import { todayString, addDays } from "./sm2.js";
 import { TICK } from "./notes.js";
 
-let ctx = null;                  // {sb, user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url, anon, demo, keep, load, rerender, tab}
+let ctx = null;                  // app.js: helpers, the outbox, the client and the shell's components (see train.mount in app.js)
 let rows = [];                   // gym items: this phone's copy, merged with the server's
 let live = null;                 // the session in progress (kept in localStorage, so a locked phone or a reload loses nothing)
-let editing = false, others = false, status = "", whoop = { connected: null, recovery: null, day: "" };
+let editing = false, status = "", whoop = { connected: null, recovery: null, day: "" };
 let sheet = null;                // what #train-sheet shows: {mode, ...}
 let food = { items: [], note: "", busy: false, error: "", photo: null };
 let just = "";                   // the tick that was just pressed, so only it plays the pop
@@ -29,21 +29,30 @@ export function mount(c) {
   rows = ctx.load("gym", []);
   live = ctx.load("gym-live", null);
   const dlg = document.createElement("dialog");
-  dlg.className = "sheet gym-sheet"; dlg.id = "train-sheet"; dlg.setAttribute("aria-labelledby", "train-sheet-title");
+  dlg.className = "sheet"; dlg.id = "train-sheet"; dlg.setAttribute("aria-labelledby", "train-sheet-title");
   document.body.append(dlg);
+  dlg.innerHTML = sheetHead("Train"); // the gestures need a head to drag by; it is redrawn on every open
+  ctx.sheetGestures(dlg);
+  dlg.addEventListener("close", () => { sheet = null; });
   for (const el of [$("train"), dlg]) {
     el.addEventListener("click", click);
     el.addEventListener("change", change);
     el.addEventListener("input", input);
   }
   $("sheet")?.addEventListener("click", click); // Account → Train rows (accountRows)
-  dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeSheet(); });
-  dlg.addEventListener("click", (e) => { if (e.target === dlg) closeSheet(); }); // a tap on the backdrop
   document.addEventListener("visibilitychange", restVisibility);
   const link = new URLSearchParams(location.search).get("whoop");
   if (link) status = link === "connected" ? "WHOOP connected." : "WHOOP didn’t connect. Try again.";
   if (live?.rest) { tick(); quietTimer = setTimeout(restQuiet, Math.max(0, live.rest.until - Date.now() - 10_000)); }
-  setInterval(() => { const el = $("gym-elapsed"); if (el && live) el.textContent = elapsed(); }, 30_000);
+  setInterval(() => { if (live) paintLive(); }, 30_000);
+}
+
+/** Today's Gym event opens the Train tab while Train is on; false (do nothing) when it's off, so the row keeps its own tap. */
+export function openToday() {
+  if (!ctx?.on()) return false;
+  ctx.tab();
+  scrollTo(0, 0);
+  return true;
 }
 
 /** Server rows in; a local row wins while its userAt is newer, and rows added here stay until the server returns them. */
@@ -159,37 +168,58 @@ export function render() {
   if (profile() && !live) whoopStatus();
 }
 
-/** A single choice as the segmented control. `labels[i]` is value i + 1. */
-const seg = (g, value, labels) => `<div class="gym-seg" role="radiogroup" style="--n: ${labels.length}">${labels.map((l, i) =>
-  `<button type="button" role="radio" data-g="${g}" data-v="${i + 1}" aria-checked="${value === i + 1}">${l}</button>`).join("")}</div>`;
+/** The shell's segmented control for one choice; `value` is the chosen index or null (no thumb). */
+const seg = (g, value, labels, label, extra = "") => `<div class="seg gym-seg" role="radiogroup" aria-label="${label}" style="--n: ${labels.length}; --i: ${value ?? 0}"${value == null ? " data-none" : ""} ${extra}>
+  <span class="thumb" aria-hidden="true"></span>${labels.map((l, i) => `<button type="button" role="radio" data-g="${g}" data-v="${i}" aria-checked="${value === i}">${l}</button>`).join("")}</div>`;
+/** Slides the thumb on the live element (no redraw), as the design system asks. */
+function pickSeg(t) {
+  const s = t.closest(".seg");
+  s.style.setProperty("--i", t.dataset.v);
+  s.removeAttribute("data-none");
+  for (const b of s.querySelectorAll("button")) b.setAttribute("aria-checked", String(b === t));
+}
 const reps = (e) => (e.kind === "time" ? `${e.hi} ${e.unit ?? "s"}` : e.lo === e.hi ? `${e.hi}` : `${e.lo}–${e.hi}`);
 const dayName = (day, opts = { weekday: "long" }) => new Date(day + "T12:00").toLocaleDateString("en-GB", opts);
+const phaseName = (phase) => ({ build: "Build", deload: "Deload", light: "Light week" }[phase] ?? "");
+
+/** The hero for the plan: what now, in the Today hero's grid. */
+function planHero(today, sessions, p, phase) {
+  const key = sessionForDay(today);
+  if (phase === "over") return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Autumn plan</p><span></span><h2>Plan finished</h2></div>
+    <p class="where gym-hero-line">It ended on 12 Dec. Write the next block, then load it here.</p></section>`;
+  if (!key) {
+    const wd = new Date().getDay(), next = KEYS.map((k) => ({ k, d: [1, 2, 3, 4, 5, 6, 7].map((n) => addDays(today, n)).find((d) => sessionForDay(d) === k) }))
+      .sort((a, b) => (a.d < b.d ? -1 : 1))[0];
+    const what = wd === p.matchDay ? "Match day" : (p.rugbyDays ?? [2, 6]).includes(wd) ? "Rugby training" : "Rest day";
+    return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Today</p><p class="k r">Next</p>
+      <h2>${what}</h2><b class="fig">${dayName(next.d, { weekday: "short" })}</b>
+      <p class="where">Nothing in the gym</p><span class="range">${esc(PLAN.sessions[next.k].name)}</span></div></section>`;
+  }
+  const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery });
+  const lead = rx.items.find((e) => e.main && e.load != null) ?? rx.items.find((e) => e.load != null);
+  return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Today · ${phaseName(rx.phase)}</p><p class="k r">${lead ? esc(lead.name) : ""}</p>
+    <h2${rx.name.length > 24 ? ` class="long"` : ""}>${esc(rx.name)}</h2><b class="fig">${lead ? kg(lead.load) : ""}</b>
+    <p class="where">${rx.items.length} exercises</p><span class="range">${lead?.up ? "Up from last time" : ""}</span></div>
+    <button class="btn primary gym-hero-btn" type="button" data-g="start" data-key="${key}">Start</button></section>`;
+}
 
 function home() {
   const today = todayString(), sessions = sessionsOf(rows), p = profile(), phase = phaseOf(today, p);
   const key = sessionForDay(today), wk = week(today, sessions);
-  const sub = phase === "over" ? "The Autumn plan ended on 12 Dec" : `Week ${planWeek(today)} · ${{ build: "Build", deload: "Deload", light: "Light week" }[phase]}`;
-  let out = ctx.head("Train", sub);
-  if (status) out += `<p class="foot">${esc(status)}</p>`;
-  if (phase !== "over") {
-    if (key) {
-      const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery });
-      const warn = warnings(key, today, Date.now(), p, sessions.filter((s) => s.date === today));
-      out += `<h2 class="section">${esc(rx.name)}</h2>`;
-      for (const w of [...warn, ...rx.notes]) out += `<p class="foot${warn.includes(w) ? " warn" : ""}">${esc(w)}</p>`;
-      out += `<button class="btn primary mt-12" type="button" data-g="start" data-key="${key}">Start</button>
-        <ul class="group flat mt-12">${rx.items.map((e) => ctx.row({ title: esc(e.name), sub: `${e.sets} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}`,
-          trail: e.load != null ? `${kg(e.load)}${e.up ? " ↑" : ""}` : "" })).join("")}</ul>`;
-    } else {
-      const wd = new Date().getDay();
-      out += `<h2 class="section">${wd === p.matchDay ? "Match day" : (p.rugbyDays ?? [2, 6]).includes(wd) ? "Rugby training" : "Rest day"}</h2><p class="sub">Nothing in the gym today.</p>`;
-    }
-    out += `<ul class="group flat mt-12">${ctx.row({ tag: "button", attrs: `data-g="others" aria-expanded="${others}"`, title: key ? "Do a different session" : "Do a session anyway", cls: "fold" })}
-      ${others ? KEYS.filter((k) => k !== key).map((k) => ctx.row({ tag: "button", attrs: `data-g="start" data-key="${k}"`, title: esc(PLAN.sessions[k].name), chev: true })).join("") : ""}</ul>`;
-    if (deloadOffer(sessions, today, p)) out += `<ul class="group mt-12">${ctx.row({ tag: "button", attrs: `data-g="deload"`, lead: ctx.ICON.sunrise,
-      title: "Take a deload week", sub: "The last two sessions felt wrecked" })}</ul>`;
+  let out = ctx.head("Train", phase === "over" ? "" : `Week ${planWeek(today)}`) + planHero(today, sessions, p, phase);
+  if (status) out += `<p class="foot mt-12">${esc(status)}</p>`;
+  if (key && phase !== "over") {
+    const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery });
+    const warn = warnings(key, today, Date.now(), p, sessions.filter((s) => s.date === today));
+    for (const w of [...warn, ...rx.notes]) out += `<p class="foot mt-12${warn.includes(w) ? " warn" : ""}">${esc(w)}</p>`;
+    out += `<ul class="group flat gym-folds mt-20">${ctx.fold("train-today", "Exercises", rx.items.length, rx.items.map((e) => `<li><div class="row"><span class="text">
+      <span class="title">${esc(e.name)}</span><span class="subtitle">${e.sets} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}</span></span>
+      ${e.load != null ? `<span class="trail">${kg(e.load)}${e.up ? " ↑" : ""}</span>` : ""}</div></li>`).join(""))}</ul>`;
   }
-  out += `<h2 class="section">This week · ${wk.count} of ${p.target ?? 4}</h2><ul class="group">${wk.slots.map((s) => ctx.row({
+  if (phase !== "over") out += `<ul class="group flat mt-12">${ctx.row({ tag: "button", attrs: `data-g="others"`, title: key ? "Do a different session" : "Do a session anyway", chev: true })}</ul>`;
+  if (deloadOffer(sessions, today, p)) out += `<ul class="group mt-12">${ctx.row({ tag: "button", attrs: `data-g="deload"`, lead: ctx.ICON.sunrise,
+    title: "Take a deload week", sub: "The last two sessions felt wrecked" })}</ul>`;
+  out += `<h2 class="section">This week · <span class="count">${wk.count} of ${p.target ?? 4}</span></h2><ul class="group">${wk.slots.map((s) => ctx.row({
     lead: s.state === "done" ? ctx.ICON.check.replace('class="glyph"', 'class="glyph success"') : ctx.ICON.calendar,
     title: esc(PLAN.sessions[s.key].name), sub: dayName(s.day),
     trail: { done: "Done", missed: "Missed", today: "Today", later: "" }[s.state], trailCls: s.state === "missed" ? "warn" : "" })).join("")}</ul>`;
@@ -200,14 +230,14 @@ function home() {
 /** Bodyweight and food: one group, today's value trailing, each opening its sheet. */
 function log(today) {
   const w = of("weight").find((r) => r.date === today)?.user_data?.kg, protein = dayFood(of("meal"), today).protein;
-  return `<h2 class="section">Log</h2><ul class="group">
+  return `<h2 class="section">Log</h2><ul class="group flat">
     ${ctx.row({ tag: "button", attrs: `data-g="weight"`, title: "Bodyweight", trail: typeof w === "number" ? kg(w) : "Add", chev: true })}
     ${ctx.row({ tag: "button", attrs: `data-g="food"`, title: "Food", trail: protein ? `${protein} g protein` : "Add", chev: true })}</ul>`;
 }
 
 function history(sessions) {
   if (!sessions.length) return "";
-  return `<h2 class="section">Recent</h2><ul class="group">${sessions.slice(0, 5).map((s) => {
+  return `<h2 class="section">Recent</h2><ul class="group flat">${sessions.slice(0, 5).map((s) => {
     const w = s.user_data?.whoop, top = (s.data.sets ?? []).filter((x) => x.done && x.load > 0 && !x.swap).map((x) => e1rm(x.load, x.reps, x.rir) ?? 0);
     return ctx.row({ title: esc(s.title), sub: dayName(s.date, { weekday: "short", day: "numeric", month: "short" })
       + `${top.length ? ` · best e1RM ${Math.max(...top)} kg` : ""}${WRECKED[s.data.wrecked - 1] ? ` · ${WRECKED[s.data.wrecked - 1]}` : ""}`,
@@ -246,12 +276,16 @@ function startSetup() {
     weight: a.weight ?? "", lifts: structuredClone(a.lifts ?? {}), rugbyDays: a.rugbyDays ?? [2, 6], matchDay: a.matchDay ?? 3, target: a.target ?? 4 };
 }
 
-/** A multi-choice row: the task tick on the left, pressed when true. */
-const pick = (g, i, title, on) => `<li class="${on ? "done" : ""}${just === `${g}${i}` ? " just" : ""}"><button type="button" class="row gym-pick" data-g="${g}" data-i="${i}" aria-pressed="${on}">
-  <span class="tick" aria-hidden="true">${TICK}</span><span class="text"><span class="title">${esc(title)}</span></span></button></li>`;
+/** A multi-choice row, built like a task row: the tick on the left, pressed when true. */
+const pick = (g, i, title, on) => `<li class="task gym-pick${on ? " done" : ""}${just === `${g}${i}` ? " just" : ""}">
+  <button class="tick" type="button" data-g="${g}" data-i="${i}" aria-pressed="${on}" aria-label="${esc(title)}">${TICK}</button>
+  <button class="row" type="button" data-g="${g}" data-i="${i}" tabindex="-1" aria-hidden="true"><span class="text"><span class="title">${esc(title)}</span></span></button></li>`;
 const field = (label, g, value, unit, extra = "") => `<li><label class="row"><span class="text"><span class="title">${esc(label)}</span></span>
   <span class="gym-field"><input class="gym-input" type="text" inputmode="decimal" data-g="${g}" value="${esc(value)}" ${extra}>${unit ? `<span class="gym-unit">${unit}</span>` : ""}</span></label></li>`;
 const check = `<svg class="gym-check" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12.5l4.25 4.25L18.5 7.5"/></svg>`;
+const stepper = (g, value, label, attrs = "") => `<span class="gym-stepper" role="group" aria-label="${label}">
+  <button type="button" class="gym-step" data-g="${g}" data-v="-1" ${attrs} aria-label="Less">−</button><b>${value ?? "–"}</b>
+  <button type="button" class="gym-step" data-g="${g}" data-v="1" ${attrs} aria-label="More">+</button></span>`;
 
 function setup() {
   if (!draft) startSetup();
@@ -276,10 +310,8 @@ function setup() {
     <div class="gym-chips" role="group" aria-label="Rugby training days">${DAYS.map((n, i) => { const wd = (i + 1) % 7, on = d.rugbyDays.includes(wd);
       return `<button type="button" data-g="rugby" data-v="${wd}" aria-pressed="${on}" aria-label="${n}">${on ? check : ""}<span>${n[0]}</span></button>`; }).join("")}</div>
     <h2 class="section">Match day</h2>
-    <div class="gym-seg" role="radiogroup" aria-label="Match day" style="--n: 7">${DAYS.map((n, i) => { const wd = (i + 1) % 7;
-      return `<button type="button" role="radio" data-g="match" data-v="${wd}" aria-checked="${d.matchDay === wd}" aria-label="${n}">${n[0]}</button>`; }).join("")}</div>
-    <h2 class="section">Gym sessions a week</h2>
-    <div class="gym-stepper"><button type="button" class="gym-step" data-g="target" data-v="-1" aria-label="Fewer">−</button><b>${d.target}</b><button type="button" class="gym-step" data-g="target" data-v="1" aria-label="More">+</button></div>`;
+    ${seg("match", DAYS.findIndex((_, i) => (i + 1) % 7 === d.matchDay), DAYS.map((n) => n[0]), "Match day")}
+    <ul class="group flat mt-28"><li><div class="row"><span class="text"><span class="title">Gym sessions a week</span></span>${stepper("target", d.target, "Gym sessions a week")}</div></li></ul>`;
   return `<p class="gym-steps" aria-label="Step ${d.step + 1} of ${STEPS.length}">${STEPS.map((_, i) => `<i class="${i <= d.step ? "on" : ""}"></i>`).join("")}</p>
     ${body}
     <div class="gym-actions"><button class="btn primary" type="button" data-g="next">${last ? (profile() ? "Save" : "Start training") : "Continue"}</button>
@@ -305,7 +337,8 @@ function finishSetup() {
 
 // ---------- The session in progress ----------
 
-const elapsed = () => `${Math.max(0, Math.floor((Date.now() - live.start) / 60000))} min${live.deload ? " · deload" : ""}`;
+const elapsed = () => `${Math.max(0, Math.floor((Date.now() - live.start) / 60000))} min`;
+const active = () => live.items.filter((e) => !live.skipped.includes(e.id));
 
 function startSession(key) {
   const today = todayString(), sessions = sessionsOf(rows), rx = prescribe(key, today, { sessions, profile: profile(), recovery: whoop.recovery });
@@ -315,34 +348,56 @@ function startSession(key) {
       return { id: e.id, name: e.name, kind: e.kind, unit: e.unit, lo: e.lo, hi: e.hi, rir: e.rir, rest: e.rest, note: e.note ?? "", up: e.up, alts: exerciseById(e.id)?.alts ?? [],
         sets: Array.from({ length: e.sets }, (_, i) => ({ load: e.load, reps: e.kind === "time" ? e.hi : (last[i]?.reps ?? e.hi), rir: null, done: false })) };
     }) };
-  others = false;
   token().then((t) => { jwt = t ?? jwt; }).catch(() => {});
   saveLive();
+  ctx.closeSheet($("train-sheet"));
   ctx.rerender();
   scrollTo(0, 0);
 }
 
-const setValue = (e, s) => (e.kind === "load" ? `${s.load == null ? "–" : num(s.load)} kg × ${s.reps ?? "–"}` : `${s.reps ?? "–"} reps`);
+const setValue = (e, s) => (e.kind === "load" ? `${s.load == null ? "–" : num(s.load)} kg × ${s.reps ?? "–"}` : e.kind === "time" ? `${e.hi} ${e.unit ?? "s"}` : `${s.reps ?? "–"} reps`);
+
+/** Where the session is: the first set not ticked, and how many are done out of all. */
+function progress() {
+  const sets = active().flatMap((e) => e.sets), done = sets.filter((s) => s.done).length;
+  for (const e of active()) { const i = e.sets.findIndex((s) => !s.done); if (i >= 0) return { e, i, done, all: sets.length }; }
+  return { e: null, i: -1, done, all: sets.length };
+}
+
+/** The live hero: the exercise now, its set and value; the rest countdown in the figure while resting. */
+function liveHero() {
+  const { e, i, done, all } = progress(), name = e ? live.swaps[e.id] ?? e.name : "All sets done";
+  const k = live.rest ? "Rest" : e ? `Set ${i + 1} of ${e.sets.length}` : "";
+  const fig = live.rest ? `<b class="fig" id="gym-rest-fig">${restLeft()}</b>` : e ? `<b class="fig">${esc(setValue(e, e.sets[i]))}</b>` : `<span></span>`;
+  return `<section class="hero" aria-label="Session now"><div class="hgrid"><p class="k">${live.rest ? "Up next" : "Now"}</p><p class="k r">${k}</p>
+    <h2${name.length > 24 ? ` class="long"` : ""}>${esc(name)}</h2>${fig}</div>
+    <div class="track" role="progressbar" aria-label="Sets done" aria-valuemin="0" aria-valuemax="${all}" aria-valuenow="${done}">
+      <time id="gym-elapsed">${elapsed()}</time><span class="rail"><i style="transform:scaleX(${all ? (done / all).toFixed(3) : 0})"></i></span><span>${done} of ${all}</span></div></section>`;
+}
+/** The 30-second clock and the rest figure change without redrawing the lists. */
+function paintLive() {
+  const el = $("gym-elapsed");
+  if (el) el.textContent = elapsed();
+}
 
 function liveScreen() {
-  let out = `<h1 class="large">${esc(live.name)}</h1><p class="sub" id="gym-elapsed">${elapsed()}</p>
-    <p class="foot mt-20">How do you feel?</p>${seg("feel", live.feel, FEEL)}`;
+  let out = `${ctx.head(live.name, live.deload ? "Deload" : "")}${liveHero()}
+    <p class="caption-h mt-20">How do you feel?</p>${seg("feel", live.feel == null ? null : live.feel - 1, FEEL, "How do you feel")}`;
   live.items.forEach((e, ei) => {
     const skipped = live.skipped.includes(e.id), name = live.swaps[e.id] ?? e.name;
     out += `<div class="gym-ex-head"><h2 class="section">${esc(name)}</h2>
       <button class="gym-more" type="button" data-g="menu" data-e="${ei}" aria-label="More for ${esc(name)}">${ctx.ICON.more}</button></div>
-      <p class="foot">${skipped ? "Skipped" : `${e.sets.length} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}${e.up ? " · weight up from last time" : ""}${!live.swaps[e.id] && e.note ? ` · ${esc(e.note)}` : ""}`}</p>`;
+      <p class="foot">${skipped ? "Skipped" : `${e.sets.length} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}${e.up ? " · weight up" : ""}${!live.swaps[e.id] && e.note ? ` · ${esc(e.note)}` : ""}`}</p>`;
     if (skipped) return;
-    out += `<ul class="group gym-sets mt-12">${e.sets.map((s, si) => `<li class="${s.done ? "done" : ""}${just === `set${ei}-${si}` ? " just" : ""}"><div class="row gym-set">
-      <button class="tick" type="button" data-g="set" data-e="${ei}" data-s="${si}" aria-pressed="${s.done}" aria-label="Set ${si + 1} ${s.done ? "done" : "not done"}">${TICK}</button>
-      <span class="text"><span class="title">Set ${si + 1}</span>${s.rir != null ? `<span class="subtitle">RIR ${s.rir}</span>` : ""}</span>
-      ${e.kind === "time" ? `<span class="trail">${e.hi} ${e.unit ?? "s"}</span>`
-        : `<button class="gym-value" type="button" data-g="edit-set" data-e="${ei}" data-s="${si}" aria-label="Set ${si + 1}: ${setValue(e, s)}. Change">${setValue(e, s)}</button>`}
-    </div></li>`).join("")}</ul>`;
+    out += `<ul class="group gym-sets mt-12">${e.sets.map((s, si) => `<li class="task${s.done ? " done" : ""}${just === `set${ei}-${si}` ? " just" : ""}">
+      <button class="tick" type="button" data-g="set" data-e="${ei}" data-s="${si}" aria-pressed="${s.done}" aria-label="Set ${si + 1}, ${esc(setValue(e, s))}: ${s.done ? "done" : "not done"}">${TICK}</button>
+      ${e.kind === "time" ? `<div class="row"><span class="text"><span class="title">Set ${si + 1}</span></span><span class="trail">${esc(setValue(e, s))}</span></div>`
+        : `<button class="row" type="button" data-g="edit-set" data-e="${ei}" data-s="${si}"><span class="text"><span class="title">Set ${si + 1}</span>${s.rir != null ? `<span class="subtitle">RIR ${s.rir}</span>` : ""}</span>
+          <span class="trail">${esc(setValue(e, s))}</span>${ctx.ICON.chev}</button>`}</li>`).join("")}</ul>`;
   });
   out += `<div class="gym-actions"><button class="btn primary" type="button" data-g="finish">Finish</button>
     <button class="btn plain gym-danger" type="button" data-g="discard">Discard session</button></div>
-    <div class="gym-rest" ${live.rest ? "" : "hidden"} role="timer" aria-live="off"><span>Rest</span><b id="gym-rest-left">${restLeft()}</b>
+    <div class="gym-rest chrome" ${live.rest ? "" : "hidden"} role="timer" aria-live="off"><span>Rest</span><b id="gym-rest-left">${restLeft()}</b>
       <button class="btn small secondary" type="button" data-g="skip-rest">Skip</button></div>`;
   return out;
 }
@@ -355,8 +410,7 @@ function tick() {
   clearInterval(restTimer);
   restTimer = setInterval(() => {
     if (!live?.rest) return clearInterval(restTimer);
-    const el = $("gym-rest-left");
-    if (el) el.textContent = restLeft();
+    for (const id of ["gym-rest-left", "gym-rest-fig"]) { const el = $(id); if (el) el.textContent = restLeft(); }
     if (Date.now() >= live.rest.until) { live.rest = null; saveLive(); clearInterval(restTimer); ctx.rerender(); }
   }, 1000);
 }
@@ -392,53 +446,36 @@ function finish(wrecked) {
   restStop();
   live = null; saveLive();
   status = "Saved. WHOOP strain comes back once the band has scored the workout.";
-  closeSheet();
+  ctx.closeSheet($("train-sheet"));
   ctx.rerender();
   scrollTo(0, 0);
   setTimeout(pullStrain, 4 * 60000);
 }
 
+/** Discard at once, with the shell's 5-second Undo (the Today pattern), instead of asking first. */
 function discard() {
+  const kept = live;
   restStop();
   live = null; saveLive();
-  closeSheet();
   ctx.rerender();
   scrollTo(0, 0);
+  ctx.toast("Session discarded", () => { live = { ...kept, rest: null }; saveLive(); ctx.rerender(); });
 }
 
-// ---------- The sheet (one dialog, one mode at a time; slides in and out) ----------
+// ---------- The sheet (one dialog, one mode at a time; the shell opens, drags and closes it) ----------
 
 function openSheet(mode, data = {}) {
   sheet = { mode, ...data };
   paintSheet();
-  const dlg = $("train-sheet");
-  dlg.classList.remove("closing"); // a close still animating is cancelled, and its done() then does nothing
-  if (!dlg.open) dlg.showModal();
+  ctx.openSheet($("train-sheet"));
 }
-function closeSheet() {
-  const dlg = $("train-sheet");
-  if (!dlg?.open || dlg.classList.contains("closing")) return;
-  // Only the close animation may end it, and only once: a stale listener would shut the next sheet when it finished opening.
-  let fallback = 0;
-  const onEnd = (e) => { if (e.animationName === "gym-sheet-out") done(); };
-  const done = () => {
-    clearTimeout(fallback); dlg.removeEventListener("animationend", onEnd);
-    if (!dlg.classList.contains("closing")) return;
-    dlg.classList.remove("closing"); dlg.close(); sheet = null;
-  };
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) { dlg.close(); sheet = null; return; }
-  dlg.classList.add("closing");
-  dlg.addEventListener("animationend", onEnd);
-  fallback = setTimeout(done, 260); // in case animationend never fires
-}
+const closeSheet = () => ctx.closeSheet($("train-sheet"));
 
-const head = (title, sub = "") => `<div class="grabber" aria-hidden="true"></div><div class="sheet-head"><div class="head-text">
-  <h2 class="headline" id="train-sheet-title">${esc(title)}</h2>${sub ? `<p class="foot">${esc(sub)}</p>` : ""}</div>
-  <button class="close" type="button" data-g="close-sheet" aria-label="Close">${ctx.ICON.close}</button></div>`;
-const stepper = (label, f, value, unit) => `<li><div class="row gym-stepper-row"><span class="text"><span class="title">${label}</span></span>
-  <button type="button" class="gym-step" data-g="step" data-f="${f}" data-v="-1" aria-label="Less ${label.toLowerCase()}">−</button>
-  <input class="gym-input" type="text" inputmode="decimal" data-g="set-${f}" value="${value ?? ""}" aria-label="${label}"><span class="gym-unit">${unit}</span>
-  <button type="button" class="gym-step" data-g="step" data-f="${f}" data-v="1" aria-label="More ${label.toLowerCase()}">+</button></div></li>`;
+function sheetHead(title, sub = "") {
+  return `<div class="grabber" aria-hidden="true"></div><div class="sheet-head"><div class="head-text">
+    <h2 class="headline" id="train-sheet-title">${esc(title)}</h2>${sub ? `<p class="foot">${esc(sub)}</p>` : ""}</div>
+    <button class="close" type="button" data-close aria-label="Close">${ctx.ICON.close}</button></div>`;
+}
 
 function paintSheet() {
   const dlg = $("train-sheet");
@@ -447,35 +484,37 @@ function paintSheet() {
   const e = live?.items[sheet.ei];
   if (sheet.mode === "set") {
     const s = e.sets[sheet.si];
-    html = `${head(`${live.swaps[e.id] ?? e.name}`, `Set ${sheet.si + 1} of ${e.sets.length}`)}
-      <ul class="group">${e.kind === "load" ? stepper("Weight", "load", s.load, "kg") : ""}${stepper("Reps", "reps", s.reps, "")}</ul>
-      ${e.kind === "load" ? `<p class="foot">Reps in reserve</p><div class="gym-seg" role="radiogroup" aria-label="Reps in reserve" style="--n: 5">${[0, 1, 2, 3, 4].map((r) =>
-        `<button type="button" role="radio" data-g="set-rir" data-v="${r}" aria-checked="${s.rir === r}">${r}</button>`).join("")}</div>` : ""}
-      <button class="btn primary" type="button" data-g="close-sheet">Done</button>`;
+    html = `${sheetHead(live.swaps[e.id] ?? e.name, `Set ${sheet.si + 1} of ${e.sets.length}`)}
+      <ul class="group">${e.kind === "load" ? `<li><div class="row"><span class="text"><span class="title">Weight</span><span class="subtitle">kg</span></span>
+          <input class="gym-input" type="text" inputmode="decimal" data-g="set-load" value="${s.load ?? ""}" aria-label="Weight in kg">${stepper("step", null, "Weight", `data-f="load"`).replace("<b>–</b>", "")}</div></li>` : ""}
+        <li><div class="row"><span class="text"><span class="title">Reps</span></span>
+          <input class="gym-input short" type="text" inputmode="numeric" data-g="set-reps" value="${s.reps ?? ""}" aria-label="Reps">${stepper("step", null, "Reps", `data-f="reps"`).replace("<b>–</b>", "")}</div></li></ul>
+      ${e.kind === "load" ? `<p class="caption-h">Reps in reserve</p>${seg("set-rir", s.rir, ["0", "1", "2", "3", "4"], "Reps in reserve")}` : ""}
+      <button class="btn primary" type="button" data-close>Done</button>`;
   }
   if (sheet.mode === "menu") {
     const skipped = live.skipped.includes(e.id);
-    html = `${head(live.swaps[e.id] ?? e.name)}<ul class="group">
+    html = `${sheetHead(live.swaps[e.id] ?? e.name)}<ul class="group">
       ${ctx.row({ tag: "button", attrs: `data-g="swap" data-e="${sheet.ei}"`, title: "Swap exercise", chev: true })}
       ${live.swaps[e.id] ? ctx.row({ tag: "button", attrs: `data-g="unswap" data-e="${sheet.ei}"`, title: `Back to ${esc(e.name)}` }) : ""}
       ${ctx.row({ tag: "button", attrs: `data-g="${skipped ? "unskip" : "skip"}" data-e="${sheet.ei}"`, title: skipped ? "Bring back" : "Skip exercise" })}</ul>`;
   }
   if (sheet.mode === "swap") {
-    html = `${head(`Swap ${e.name}`)}${e.alts.length ? `<ul class="group">${e.alts.map((a) => ctx.row({ tag: "button", attrs: `data-g="swap-to" data-name="${esc(a)}"`,
+    html = `${sheetHead(`Swap ${e.name}`)}${e.alts.length ? `<ul class="group">${e.alts.map((a) => ctx.row({ tag: "button", attrs: `data-g="swap-to" data-name="${esc(a)}"`,
         title: esc(a), trail: live.swaps[e.id] === a ? check : "" })).join("")}</ul>` : ""}
       <ul class="group flat"><li><input class="gym-text" type="text" data-g="swap-other" value="${esc(sheet.other ?? "")}" placeholder="Something else" aria-label="Something else" autocapitalize="sentences"></li></ul>
       <button class="btn secondary" type="button" data-g="swap-to-other" ${(sheet.other ?? "").trim() ? "" : "disabled"}>Swap</button>`;
   }
-  if (sheet.mode === "finish") {
-    const open = live.items.filter((x) => !live.skipped.includes(x.id)).flatMap((x) => x.sets).filter((s) => !s.done).length;
-    html = `${head("Finish session", open ? `${open} unticked ${open === 1 ? "set doesn’t" : "sets don’t"} count` : "")}
-      <p class="foot">How do you feel now?</p>
-      <ul class="group">${WRECKED.map((w, i) => ctx.row({ tag: "button", attrs: `data-g="finish-as" data-v="${i + 1}"`, title: w })).join("")}</ul>`;
+  if (sheet.mode === "others") {
+    const key = sessionForDay(todayString());
+    html = `${sheetHead("Another session")}<ul class="group">${KEYS.filter((k) => k !== key).map((k) => ctx.row({ tag: "button", attrs: `data-g="start" data-key="${k}"`,
+      title: esc(PLAN.sessions[k].name), sub: `${PLAN.sessions[k].items.length} exercises`, chev: true })).join("")}</ul>`;
   }
-  if (sheet.mode === "discard") {
-    html = `${head("Discard this session?", "Nothing from it is saved.")}
-      <ul class="group">${ctx.row({ tag: "button", attrs: `data-g="discard-yes"`, title: "Discard session", cls: "destructive" })}</ul>
-      <ul class="group">${ctx.row({ tag: "button", attrs: `data-g="close-sheet"`, title: "Keep going" })}</ul>`;
+  if (sheet.mode === "finish") {
+    const open = active().flatMap((x) => x.sets).filter((s) => !s.done).length;
+    html = `${sheetHead("Finish session", open ? `${open} unticked ${open === 1 ? "set doesn’t" : "sets don’t"} count` : "")}
+      <p class="caption-h">How do you feel now?</p>
+      <ul class="group">${WRECKED.map((w, i) => ctx.row({ tag: "button", attrs: `data-g="finish-as" data-v="${i + 1}"`, title: w })).join("")}</ul>`;
   }
   if (sheet.mode === "weight") {
     const today = todayString(), entries = of("weight").map((r) => ({ date: r.date, kg: r.user_data?.kg })).filter((x) => typeof x.kg === "number");
@@ -484,7 +523,7 @@ function paintSheet() {
       : t.change == null ? `7-day average ${t.avg} kg. The weekly change shows after a second week.`
       : `7-day average ${t.avg} kg, ${t.change >= 0 ? "+" : ""}${t.change} kg on last week. Aim for +${t.lo} to +${t.hi}.`;
     const nudge = { low: "Gaining slower than the aim: add a snack or a bigger portion.", high: "Gaining faster than the aim.", flat: "Flat for two weeks: eat more." }[t?.status] ?? "";
-    html = `${head("Bodyweight", "This morning")}<ul class="group">${field("Weight", "weight", v, "kg", `aria-label="Bodyweight in kg" placeholder="–"`)}</ul>
+    html = `${sheetHead("Bodyweight", "This morning")}<ul class="group">${field("Weight", "weight", v, "kg", `aria-label="Bodyweight in kg" placeholder="–"`)}</ul>
       <p class="foot">${esc(line)}${nudge ? ` ${esc(nudge)}` : ""}</p>
       <button class="btn primary" type="button" data-g="save-weight">Save</button>`;
   }
@@ -498,7 +537,7 @@ function foodSheet() {
   const today = todayString(), meals = of("meal").filter((m) => m.date === today), totals = dayFood(of("meal"), today);
   const est = food.items.reduce((t, i) => ({ p: t.p + i.protein_g, k: t.k + i.kcal }), { p: 0, k: 0 });
   const ready = food.photo || food.note.trim();
-  return `${head("Food", `About ${totals.protein} g protein of ${PROTEIN_TARGET(profile()?.weight)} g today`)}
+  return `${sheetHead("Food", `About ${totals.protein} g protein of ${PROTEIN_TARGET(profile()?.weight)} g today`)}
     ${meals.length ? `<ul class="group">${meals.map((m) => ctx.row({ title: esc(m.data.note || m.data.items.map((i) => i.name).join(", ")),
       trail: `${m.data.items.reduce((a, i) => a + i.protein_g, 0)} g` })).join("")}</ul>` : ""}
     <ul class="group flat">
@@ -545,33 +584,36 @@ function click(ev) {
   switch (d.g) {
     // Plan
     case "start": return startSession(d.key);
-    case "others": others = !others; return ctx.rerender();
+    case "others": return openSheet("others");
     case "deload": patch(profileRow(), { deloadFrom: todayString() }); status = "Deload week: half the sets, same loads, until next week."; return ctx.rerender();
     case "weight": return openSheet("weight");
     case "food": food = { items: [], note: "", busy: false, error: "", photo: null }; return openSheet("food");
     // Account → Train
     case "whoop": return connectWhoop();
-    case "edit": $("sheet")?.close(); ctx.tab(); editing = true; startSetup(); ctx.rerender(); return scrollTo(0, 0);
+    case "edit": ctx.closeSheet($("sheet")); ctx.tab(); editing = true; startSetup(); ctx.rerender(); return scrollTo(0, 0);
     // Setup
     case "cancel": editing = false; draft = null; return ctx.rerender();
     case "parq": draft.parq[Number(d.i)] = !draft.parq[Number(d.i)]; if (draft.parq[Number(d.i)]) just = `parq${d.i}`; return ctx.rerender();
     case "surgery": case "concussion": draft[d.g] = !draft[d.g]; if (draft[d.g]) just = `${d.g}0`; return ctx.rerender();
     case "rugby": { const v = Number(d.v); draft.rugbyDays = draft.rugbyDays.includes(v) ? draft.rugbyDays.filter((x) => x !== v) : [...draft.rugbyDays, v]; return ctx.rerender(); }
-    case "match": draft.matchDay = Number(d.v); return ctx.rerender();
+    case "match": draft.matchDay = (Number(d.v) + 1) % 7; return pickSeg(t);
     case "target": draft.target = Math.min(7, Math.max(1, draft.target + Number(d.v))); return ctx.rerender();
     case "next": if (draft.step === STEPS.length - 1) return finishSetup(); draft.step++; ctx.rerender(); return scrollTo(0, 0);
     case "back": draft.step--; ctx.rerender(); return scrollTo(0, 0);
     // Session
-    case "feel": live.feel = Number(d.v); saveLive(); return ctx.rerender();
+    case "feel": live.feel = Number(d.v) + 1; saveLive(); return pickSeg(t);
     case "set": return toggleSet(ei, si);
     case "edit-set": return openSheet("set", { ei, si });
     case "step": {
       const s = live.items[ei].sets[si], dir = Number(d.v);
       if (d.f === "load") setLoad(ei, si, Math.max(0, round((s.load ?? 0) + dir * 2.5, 0.5)));
       else s.reps = Math.max(0, (s.reps ?? 0) + dir);
-      saveLive(); paintSheet(); return ctx.rerender();
+      saveLive();
+      const box = $("train-sheet").querySelector(`[data-g="set-${d.f}"]`);
+      if (box) box.value = d.f === "load" ? s.load ?? "" : s.reps ?? "";
+      return ctx.rerender();
     }
-    case "set-rir": live.items[ei].sets[si].rir = Number(d.v); saveLive(); paintSheet(); return ctx.rerender();
+    case "set-rir": live.items[ei].sets[si].rir = Number(d.v); saveLive(); pickSeg(t); return ctx.rerender();
     case "menu": return openSheet("menu", { ei });
     case "swap": return openSheet("swap", { ei, other: "" });
     case "swap-to": live.swaps[live.items[ei].id] = d.name; saveLive(); closeSheet(); return ctx.rerender();
@@ -582,10 +624,8 @@ function click(ev) {
     case "skip-rest": restStop(); saveLive(); return ctx.rerender();
     case "finish": return openSheet("finish");
     case "finish-as": return finish(Number(d.v));
-    case "discard": return openSheet("discard");
-    case "discard-yes": return discard();
+    case "discard": return discard();
     // Sheets
-    case "close-sheet": return closeSheet();
     case "save-weight": {
       const v = parse(sheet.value ?? $("train-sheet").querySelector('[data-g="weight"]')?.value);
       if (!(v > 20 && v < 300)) return;
@@ -627,7 +667,7 @@ async function change(ev) {
 }
 
 async function connectWhoop() {
-  if (ctx.demo) { status = "WHOOP connects on the real app, not the demo."; $("sheet")?.close(); ctx.tab(); return ctx.rerender(); }
+  if (ctx.demo) { status = "WHOOP connects on the real app, not the demo."; ctx.closeSheet($("sheet")); ctx.tab(); return ctx.rerender(); }
   try { location.href = (await call("whoop", { action: "connect" })).url; }
   catch (e) { status = `WHOOP: ${e.message}`; ctx.rerender(); }
 }

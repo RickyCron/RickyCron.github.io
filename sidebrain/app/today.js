@@ -142,7 +142,18 @@ const nextDayOfMonth = (today, d) => {
   for (let i = 0; i < 13; i++, m = m === 12 ? 1 : m + 1, y += m === 1 ? 1 : 0) if (real(y, m, d) && ymd(y, m, d) >= today) return ymd(y, m, d);
   return null;
 };
-const nextWeekday = (today, w) => plusDays(today, (w - dow(today) + 7) % 7); // the same weekday is today
+const nextWeekday = (today, w) => plusDays(today, (w - dow(today) + 7) % 7); // the same weekday is today ("by wed" on a Wednesday)
+/** "fri" or "on fri" means the coming one: typed on a Friday, that is next Friday, unless `keep` (a time still ahead today). */
+const comingWeekday = (today, w, keep = false) => plusDays(today, ((w - dow(today) + 7) % 7) || (keep ? 0 : 7));
+/** Whether the time after the weekday ("3pm", "at 6", "evening") is still ahead of `now`, on `today`. A bare hour under 8 is pm. */
+function ahead(m, today, now) {
+  if (!now || ymd(now.getFullYear(), now.getMonth() + 1, now.getDate()) !== today) return false;
+  const part = m[2]?.toLowerCase(), mins = now.getHours() * 60 + now.getMinutes();
+  if (part) return mins < { morning: 12, afternoon: 17, evening: 24, tonight: 24, night: 24 }[part] * 60;
+  if (!m[3]) return false;
+  const n = Number(m[3]), ap = m[5]?.toLowerCase(), h = ap === "pm" ? (n % 12) + 12 : ap === "am" ? n % 12 : n < 8 ? n + 12 : n;
+  return mins < h * 60 + Number(m[4] ?? 0);
+}
 const nextMonday = (today) => plusDays(today, ((8 - dow(today)) % 7) || 7);
 /** "next fri": that weekday in the coming Monday-to-Sunday week. */
 const weekdayNextWeek = (today, w) => plusDays(nextMonday(today), (w + 6) % 7);
@@ -160,10 +171,14 @@ const PATTERNS = [
   [`${PRE}(?:tomorrow|tmrw)`, (t) => plusDays(t, 1)],
   // A bare weekday counts after on/by/due/this, as the first or last word, or before a time ("gym mon evening",
   // "call mum fri at 6", "dentist fri 3pm"). Anywhere else ("buy sun cream") it is a word. Tapping the highlight undoes a wrong one.
-  [`(?:on|by|due|this)\\s+(${WD})`, (t, m) => nextWeekday(t, weekday(m[1]))],
-  [`(${WD})(?=[\\s.,;!?—–-]*$)`, (t, m) => nextWeekday(t, weekday(m[1]))],
-  [`(?<=^\\s*)(${WD})`, (t, m) => nextWeekday(t, weekday(m[1]))],
-  [`(${WD})(?=,?\\s+(?:morning|afternoon|evening|tonight|night|at|by|\\d))`, (t, m) => nextWeekday(t, weekday(m[1]))],
+  // Typed on that weekday (Ricky, 17 Oct): "fri" and "on fri" mean next week unless the time after it is still ahead today;
+  // "this fri", "by fri" and "due fri" mean today. Before a time comes first, so it wins the tie with "on fri".
+  [`(?:on\\s+)?(${WD})(?=,?\\s+(?:(morning|afternoon|evening|tonight|night)|(?:at\\s+)?(\\d{1,2})(?:[:.](\\d{2}))?\\s*(am|pm)?|by)(?![\\p{L}\\d]))`,
+    (t, m, now) => comingWeekday(t, weekday(m[1]), ahead(m, t, now))],
+  [`(?:by|due|this)\\s+(${WD})`, (t, m) => nextWeekday(t, weekday(m[1]))],
+  [`on\\s+(${WD})`, (t, m) => comingWeekday(t, weekday(m[1]))],
+  [`(${WD})(?=[\\s.,;!?—–-]*$)`, (t, m) => comingWeekday(t, weekday(m[1]))],
+  [`(?<=^\\s*)(${WD})`, (t, m) => comingWeekday(t, weekday(m[1]))],
 ].map(([re, day]) => [new RegExp(`${B}(?:${re})${E}`, "giu"), day]);
 
 /** The date phrase in a to-do, as typed: {title, date, past, start, end, keys}. `start`/`end` mark the phrase (with a leading
@@ -171,13 +186,13 @@ const PATTERNS = [
  *  all (`ignore`). The last phrase wins ("Book sat exam room tomorrow" → tomorrow); on a tie, the longer one ("fri 9 oct").
  *  An explicit past day ("1/9") stays this year and comes back with past: true; a weekday that doesn't fit the day
  *  number ("fri 31") is ignored in favour of the number. */
-export function parseWhen(input, today, ignore = new Set()) {
+export function parseWhen(input, today, ignore = new Set(), now = null) {
   const s = String(input ?? "");
   let best = null;
   const keys = [];
   for (const [re, day] of PATTERNS) {
     for (const m of s.matchAll(re)) {
-      const date = day(today, m), key = m[0].toLowerCase().replace(/\s+/g, " ");
+      const date = day(today, m, now), key = m[0].toLowerCase().replace(/\s+/g, " ");
       if (!date || ignore.has(key)) continue;
       keys.push(key);
       const end = m.index + m[0].length;
@@ -210,13 +225,40 @@ export function daySchedule(events, now = new Date(), limit = 3, all = false) {
     // Begun before today (a trip, an overnight flight): on the all-day line while it is still running.
     if (start && start < dayStart) { if (end && end > now) allDay.push(title(e)); continue; }
     if (e.data?.allDay === true || !start) { allDay.push(title(e)); continue; }
-    timed.push({ id: e.id, title: title(e), start, time: clock(start), location: text(e.data, "location") ?? "",
+    timed.push({ id: e.id, title: title(e), start, end, time: clock(start), location: text(e.data, "location") ?? "",
                  state: (end ?? start) <= now ? "past" : start <= now ? "now" : "next" });
   }
   timed.sort((a, b) => a.start - b.start || cmp(a.title, b.title));
   const next = timed.filter((e) => e.state === "next");
   return { allDay, past: timed.filter((e) => e.state === "past"), now: timed.filter((e) => e.state === "now"),
            next: all ? next : next.slice(0, limit), more: next.length > limit };
+}
+
+// ---------- The hero: what now? (the Focus direction's departure board) ----------
+
+/** The event the hero shows: the one on now, else the next one today, else the first timed one after today (as far as the
+ *  fetched events reach). {id, title, start, end, location, state: "now" | "next" | "later"}, or null. */
+export function heroEvent(events, now = new Date()) {
+  const s = daySchedule(events, now, 1), e = s.now[0] ?? s.next[0];
+  if (e) return { id: e.id, title: e.title, start: e.start, end: e.end, location: e.location, state: e.state };
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  const later = events.map((x) => ({ x, start: instant(x.data?.start) }))
+    .filter(({ x, start }) => start && start >= tomorrow && !gone(x) && x.data?.allDay !== true)
+    .sort((a, b) => a.start - b.start || cmp(a.x.id, b.x.id))[0];
+  return later ? { id: later.x.id, title: text(later.x.data, "title") ?? later.x.title ?? "Event", start: later.start, end: instant(later.x.data?.end),
+                   location: text(later.x.data, "location") ?? "", state: "later" } : null;
+}
+
+/** The hero's captions and big figure: "Up next" / "Starts in" "25 min", "On now" / "Ends in" "40 min", "Tomorrow" /
+ *  "Starts at" "11:00". Past three hours a countdown turns into the clock time. Range is "14:40–15:40" (not while on). */
+export function heroFigure(e, now = new Date()) {
+  const mins = (d) => Math.max(0, Math.round((d - now) / 6e4));
+  const span = (d, word) => (mins(d) < 180 ? [`${word} in`, mins(d) === 0 ? "now" : prep(mins(d))] : [`${word} at`, clock(d)]);
+  const range = e.end ? `${clock(e.start)}–${clock(e.end)}` : clock(e.start);
+  if (e.state === "now") { const [k, fig] = e.end ? span(e.end, "Ends") : ["Started at", clock(e.start)]; return { label: "On now", k, fig, range: "" }; }
+  if (e.state === "next") { const [k, fig] = span(e.start, "Starts"); return { label: "Up next", k, fig, range }; }
+  const day = localDay(e.start), next = localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+  return { label: day === next ? "Tomorrow" : shortDay(day), k: "Starts at", fig: clock(e.start), range };
 }
 
 // ---------- Pings, Up next and the Inbox (docs/(C) Brief + ping contract.md §1, §6) ----------
