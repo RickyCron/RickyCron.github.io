@@ -1,8 +1,8 @@
-// Sidebrain phone app service worker: keeps the app shell (and the pinned supabase-js module) cached so the
+// Sidebrain phone app service worker: keeps the app shell (and vendor/: supabase-js and the barcode reader) cached so the
 // app opens offline, shows the daily reminder, and sets the Home Screen badge. Card data is never cached here;
 // app.js keeps its own copy in localStorage and Supabase stays the source of truth.
-const CACHE = "sidebrain-v23"; // bump when the shell changes (v23: the phone redesign merged, green icon; v22: Inbox swipes and batched Moodle, + composer chip, sign-in; v20: phone redesign shell, Today and Account; v19: Train audit fixes; v18: Train setup redesign; v17: Train plugin; v16: module map merged; v15: notes Listen; v14: notes precedence + class-tagged captures)
-const SHELL = ["./", "index.html", "styles.css", "app.js", "sm2.js", "today.js", "notes.js", "gym.js", "train.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "apple-touch-icon.png"];
+const CACHE = "sidebrain-v25"; // bump when the shell changes (v25: v2 merged: Food, check-in and Suggestions, Inbox item sheet, Priority messages, Nexi, supabase-js self-hosted; v24: Food v2, food.js and the barcode reader; v23: the phone redesign merged, green icon; v22: Inbox swipes and batched Moodle, + composer chip, sign-in; v20: phone redesign shell, Today and Account; v19: Train audit fixes; v18: Train setup redesign; v17: Train plugin; v16: module map merged; v15: notes Listen; v14: notes precedence + class-tagged captures)
+const SHELL = ["./", "index.html", "styles.css", "app.js", "sm2.js", "today.js", "notes.js", "nudges.js", "gym.js", "train.js", "food.js", "nexi.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "apple-touch-icon.png"];
 
 // GitHub Pages sends max-age=600, so every fetch of our own files skips the HTTP cache: the cached shell is
 // always one consistent version.
@@ -17,17 +17,17 @@ self.addEventListener("activate", (event) => {
 });
 
 // Our own files: network first, cache only offline. Stale-while-revalidate let a new index.html run with an old
-// app.js (an empty Today on 7 Oct). The pinned CDN module never changes, so it stays cache first.
+// app.js (an empty Today on 7 Oct). vendor/ is pinned and never changes, so it stays cache first.
 self.addEventListener("fetch", (event) => {
   const req = event.request, url = new URL(req.url);
-  if (req.method !== "GET" || !(url.origin === location.origin || url.origin === "https://cdn.jsdelivr.net")) return;
+  if (req.method !== "GET" || url.origin !== location.origin) return;
   event.respondWith(caches.open(CACHE).then(async (cache) => {
     const key = req.mode === "navigate" ? "index.html" : req; // ?demo=1 and other queries open the same shell
     const cached = await cache.match(key);
-    if (url.origin !== location.origin && cached) return cached;
-    const own = url.origin === location.origin;
+    // vendor/ (supabase-js, and the barcode reader, ~1 MB) is cached on first use and never changes: cache first.
+    if (url.pathname.includes("/vendor/") && cached) return cached;
     try {
-      const res = await fetch(own ? new Request(req.mode === "navigate" ? "index.html" : req.url, { cache: "no-cache" }) : req);
+      const res = await fetch(new Request(req.mode === "navigate" ? "index.html" : req.url, { cache: "no-cache" }));
       if (res.ok) cache.put(key, res.clone());
       return res;
     } catch (e) {
@@ -37,8 +37,8 @@ self.addEventListener("fetch", (event) => {
   }));
 });
 
-// The `push` edge function sends a ping as {title, body: "", url: "./?open=<target>", tag: <ping id>} (docs/(C) Brief +
-// ping contract.md §3), so it shows the title only, and the daily digest as {title, body, badge}. Each ping has its own
+// The `push` edge function sends a ping as {title, body, url: "./?open=<target>", tag: <ping id>} (docs/(C) Brief +
+// ping contract.md §3): the title, plus a body only on a class nudge ("Read: …"), and the daily digest as {title, body, badge}. Each ping has its own
 // tag, so one never replaces another; the tag rides along as ?ping= so the app can mark it seen.
 self.addEventListener("push", (event) => {
   let msg = {};

@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sidebrain</title>
   <meta name="description" content="What’s due today, flashcards, lecture notes and practice from Sidebrain, plus quick notes and to-dos from the phone.">
+  <!-- Defence in depth for untrusted message text and AI output; the hash is the theme script's below (web/nexi.test.mjs checks it). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-MsVmYvvchYYuYJxp/HE1b9z9+wdvD/gd/trzQXpJfME=' https://accounts.google.com/gsi/client; connect-src 'self' https://rdwavprncthvujmckige.supabase.co wss://rdwavprncthvujmckige.supabase.co https://accounts.google.com/gsi/ https://world.openfoodfacts.org; img-src 'self' data: blob: https://rdwavprncthvujmckige.supabase.co; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/; frame-src https://accounts.google.com/gsi/; media-src 'self' blob:; base-uri 'none'; form-action 'none'; object-src 'none'">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
@@ -27,6 +29,9 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5L8 12l6.5 6.5"/></svg>
     </button>
     <p class="bar-title" id="bar-title" aria-hidden="true"></p>
+    <button class="circle" id="ask" type="button" aria-label="Ask Nexi" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.25c4.56 0 8.25 3.13 8.25 7s-3.69 7-8.25 7c-1.1 0-2.15-.18-3.1-.52L4.75 19.5l1.2-3.6c-1.4-1.3-2.2-2.9-2.2-4.65 0-3.87 3.69-7 8.25-7z"/></svg>
+    </button>
     <button class="pill" id="read-all" type="button" hidden>Mark all read</button>
     <button class="circle avatar" id="account" type="button" aria-label="Account" hidden></button>
     <button class="circle" id="contents" type="button" aria-label="Contents" aria-expanded="false" aria-controls="contents-menu" hidden>
@@ -109,10 +114,11 @@
   <dialog class="sheet" id="add-sheet" aria-label="Add">
     <div class="grabber" aria-hidden="true"></div>
     <div class="sheet-head">
-      <div class="seg" role="tablist" aria-label="What to add" style="--n: 2">
+      <div class="seg" role="tablist" aria-label="What to add" style="--n: 3">
         <span class="thumb" aria-hidden="true"></span>
         <button type="button" role="tab" data-mode="todo" aria-selected="true">To-do</button>
         <button type="button" role="tab" data-mode="note" aria-selected="false">Note</button>
+        <button type="button" role="tab" data-mode="ask" aria-selected="false">Ask</button>
       </div>
       <button class="close" type="button" data-close aria-label="Close">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 7.5l9 9M16.5 7.5l-9 9"/></svg>
@@ -139,28 +145,50 @@
     <form class="compose pane" data-compose="add" autocomplete="off" hidden></form>
   </dialog>
 
-  <dialog class="sheet" id="ping-sheet" aria-labelledby="ping-title">
+  <dialog class="sheet tall" id="item-sheet" aria-labelledby="item-title">
     <div class="grabber" aria-hidden="true"></div>
     <div class="sheet-head">
       <div class="head-text">
-        <h2 class="headline" id="ping-title"></h2>
-        <p class="foot" id="ping-when"></p>
+        <h2 class="headline" id="item-title"></h2>
+        <p class="foot" id="item-meta"></p>
       </div>
       <button class="close" type="button" data-close aria-label="Close">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 7.5l9 9M16.5 7.5l-9 9"/></svg>
       </button>
     </div>
-    <ul class="group" id="ping-moves"></ul>
-    <ul class="group">
-      <li><button class="row" type="button" data-pdone>
-        <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.25"/><path d="M8.5 12.25l2.4 2.4 4.6-5"/></svg>
-        <span class="text"><span class="title" id="ping-done-label">Mark as done</span></span>
-      </button></li>
-    </ul>
+    <div class="pane" id="item-body"></div>
+    <div class="sheet-foot" id="item-foot"></div>
+  </dialog>
+
+  <dialog class="sheet nexi" id="nexi-sheet" aria-labelledby="nexi-title">
+    <div class="grabber" aria-hidden="true"></div>
+    <div class="sheet-head">
+      <div class="head-text">
+        <h2 class="headline" id="nexi-title">Nexi</h2>
+        <p class="foot" id="nexi-about"></p>
+      </div>
+      <button class="close" type="button" data-close aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 7.5l9 9M16.5 7.5l-9 9"/></svg>
+      </button>
+    </div>
+    <div class="nexi-log" id="nexi-log"></div>
+    <p class="sr-only" id="nexi-live" aria-live="polite"></p>
+    <div class="nexi-chips" id="nexi-chips"></div>
+    <form class="nexi-form" id="nexi-form" autocomplete="off">
+      <input id="nexi-q" type="text" maxlength="2000" placeholder="Ask Nexi" aria-label="Ask Nexi" enterkeyhint="send" autocapitalize="sentences">
+      <button class="send" id="nexi-send" type="submit" aria-label="Send" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 18.5v-13M6.5 11L12 5.5l5.5 5.5"/></svg></button>
+    </form>
   </dialog>
 
   <dialog class="sheet action" id="confirm-sheet" aria-labelledby="confirm-msg">
     <ul class="group"><li><p class="msg" id="confirm-msg"></p></li><li><button class="row destructive" type="button" id="confirm-yes"></button></li></ul>
+    <ul class="group"><li><button class="row" type="button" data-close>Cancel</button></li></ul>
+  </dialog>
+
+  <dialog class="sheet action" id="sug-sheet" aria-labelledby="sug-msg">
+    <ul class="group"><li><p class="msg" id="sug-msg"></p></li>
+      <li><button class="row" type="button" data-act="sug-mute" data-mute="snooze">Snooze 3 days</button></li>
+      <li><button class="row" type="button" data-act="sug-mute" data-mute="dismiss">Dismiss</button></li></ul>
     <ul class="group"><li><button class="row" type="button" data-close>Cancel</button></li></ul>
   </dialog>
 

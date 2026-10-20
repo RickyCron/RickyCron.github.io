@@ -131,7 +131,8 @@ img { display: block; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0; transition: opacity 200ms; pointer-events: none;
 }
 html.scrolled .bar::before, html.scrolled .bar-title { opacity: 1; }
-.bar #account, .bar #contents, .bar #more, .bar #read-all { margin-left: auto; }
+.bar #account, .bar #contents, .bar #more, .bar #read-all, .bar #ask { margin-left: auto; }
+.bar #ask:not([hidden]) ~ #account { margin-left: 0; }
 .bar #contents:not([hidden]) + #more { margin-left: 0; }
 .bar #read-all:not([hidden]) + #account { margin-left: 0; }
 .bar:has(#read-all:not([hidden])) .bar-title { left: 16px; right: auto; text-align: left; } /* Mark all read sits right, beside the avatar; the capsule leaves no room to centre the title */
@@ -419,6 +420,22 @@ label.row:has(input[switch]) { cursor: pointer; }
 .prio-line .why { font: var(--foot); color: var(--label-2); margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .prio-line.done .title { color: var(--label-2); }
 html.on-today { --under-dock: var(--surface); }
+/* The morning check-in: one grouped surface over the hero, the same height for both questions (K3, K9). */
+.checkin { margin-top: 16px; background: var(--surface); border-radius: 24px; padding: 12px 16px 16px; }
+.checkin .qrow { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.checkin .q { font: var(--headline); min-width: 0; }
+.checkin .back-q { font: var(--subhead); min-height: 44px; margin: -11px -8px -11px 0; padding: 0 8px; }
+.checkin .answers { display: grid; grid-template-columns: repeat(var(--n), 1fr); gap: 8px; }
+.checkin .btn { height: 44px; padding: 0 8px; }
+/* Suggestions: a row, an optional Started, and a 44 pt More (G10). */
+.sugs .sug { display: flex; align-items: center; padding-right: 8px; }
+.sugs .sug > .row { flex: 1; min-width: 0; padding-right: 4px; }
+.sugs .sug > .btn.small { flex: none; position: relative; height: 32px; padding: 0 12px; font: var(--subhead); font-weight: 600; margin: 0 2px; }
+.sugs .sug > .btn.small::after { content: ""; position: absolute; inset: -6px -2px; }
+.sugs .sug > .circle { flex: none; color: var(--label-2); }
+.sugs .sug > .circle::before { display: none; }
+.sugs .sug > .circle:active { background: var(--fill); }
+.day .list.sugs { --inset: 54px; }
 
 /* ---------- The day sheet: persistent under Today's hero, two detents (peek, full), spring physics in app.js ---------- */
 .scrim { position: fixed; inset: 0; z-index: 14; background: var(--scrim); opacity: 0; pointer-events: none; }
@@ -629,6 +646,54 @@ html.on-today { --under-dock: var(--surface); }
 .pill::before { content: ""; position: absolute; inset: 4px 0; border-radius: 999px; z-index: -1; background: var(--chrome);
   -webkit-backdrop-filter: blur(14px) saturate(180%); backdrop-filter: blur(14px) saturate(180%); box-shadow: var(--chrome-edge), var(--chrome-shadow); transition: transform 100ms var(--out); }
 .pill:active::before { transform: scale(.95); }
+/* ---------- The item sheet: an Inbox row's content over the Inbox; the head and Done / Later stay put while it scrolls ---------- */
+.sheet.tall .sheet-head { position: sticky; top: -6px; z-index: 3; margin: -12px -16px -8px; padding: 12px 16px 8px; background: var(--sheet-bg); }
+.sheet.tall > .grabber { position: relative; z-index: 4; } /* over the head's top padding until it scrolls away */
+.sheet-foot { position: sticky; bottom: -20px; z-index: 3; margin: auto -16px -20px; padding: 8px 16px 20px; background: var(--sheet-bg); display: flex; flex-direction: column; gap: 8px; }
+.sheet-foot .btn { flex: 1; }
+.sheet-foot .later:not([hidden]) { animation: rise 150ms var(--out); }
+.sheet-foot .later .row { min-height: 44px; }
+#item-body { gap: 12px; }
+#item-body > .caption-h { margin: 8px 16px -4px; }
+#item-body > .listen { margin-top: -4px; }
+#item-body > .prose { margin-top: 0; }
+.actions.wrap { flex-wrap: wrap; }
+.btns { display: flex; flex-direction: column; gap: 8px; }
+/* Content on a sheet sits on --raised, so its cards still read in dark mode (the sheet is --surface's colour there). */
+.sheet .prose .card, .sheet .prose .callout, .sheet .prose .table, .sheet .prose .diagram, .sheet .prose .reveal { background: var(--raised); }
+.sheet .prose .callout.c-key { background: var(--tint); }
+/* A message: its own words, plain text, selectable. */
+.msg { display: flex; flex-direction: column; gap: 8px; padding: 16px; border-radius: 24px; background: var(--raised); }
+.msg-text { display: flex; flex-direction: column; gap: 10px; font: var(--reading); overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
+.msg-text + .foot { margin-top: 6px; }
+textarea.draft { display: block; width: 100%; min-height: 148px; padding: 14px 16px; resize: none; font: var(--reading); font-size: max(16px, 1rem); }
+.how { display: flex; align-items: center; }
+.how input { flex: 1; min-width: 0; height: 48px; padding: 0 0 0 16px; }
+.how input::placeholder, .nexi-form input::placeholder { color: var(--label-2); }
+.how input:focus-visible, .nexi-form input:focus-visible { outline: none; }
+
+/* ---------- Nexi: one sheet for every Ask; the log scrolls, the field stays at the bottom ---------- */
+.sheet.nexi { overflow: hidden; }
+.sheet.nexi[open] { gap: 12px; }
+.nexi-log { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.nexi-hint { padding: 0 4px; }
+.bubble { max-width: 86%; padding: 10px 14px; border-radius: 20px; background: var(--raised); font: var(--body); overflow-wrap: anywhere; display: flex; flex-direction: column; gap: 8px;
+  -webkit-user-select: text; user-select: text; animation: rise 200ms var(--out); }
+.bubble.me { align-self: flex-end; background: var(--fill-2); }
+.bubble.typing { flex-direction: row; gap: 5px; padding: 15px 16px; }
+.bubble.typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--label-3); animation: typing 1.2s ease-in-out infinite; }
+.bubble.typing i:nth-child(2) { animation-delay: .15s; }
+.bubble.typing i:nth-child(3) { animation-delay: .3s; }
+@keyframes typing { 0%, 60%, 100% { opacity: .35; } 30% { opacity: 1; } }
+.nexi-chips { display: flex; flex-wrap: wrap; gap: 0 8px; margin: -6px 0; }
+.nexi-chips:empty { display: none; }
+.nexi-form { display: flex; align-items: center; gap: 6px; min-height: 52px; padding: 4px 4px 4px 16px; border-radius: 26px; background: var(--raised); flex: none; }
+.nexi-form input { flex: 1; min-width: 0; height: 44px; }
+.send { width: 44px; height: 44px; flex: none; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: var(--on-accent); transition: transform 100ms var(--out); }
+.send:active:not(:disabled) { transform: scale(.92); }
+.send:disabled { background: var(--fill); color: var(--label-3); }
+.send svg { width: 20px; height: 20px; stroke-width: 2.2; }
+
 /* An item opened from a link: a brief tint, then it fades. */
 .spot { animation: spot 1600ms ease-out; }
 @keyframes spot { from, 40% { background: var(--tint); } }
@@ -710,6 +775,7 @@ main.swiping { position: relative; z-index: 1; min-height: 100dvh; background: v
   .toast { transition: opacity 150ms ease-out, visibility 0s linear 150ms !important; transform: none !important; }
   .toast.on { transition: opacity 150ms ease-out !important; }
   .just .tick .disc, .just .tick .check, .fresh, .spot { animation: none !important; }
+  .bubble.typing i { animation: none !important; opacity: .6; }
   .skeleton { animation: fade 150ms ease-out 300ms forwards !important; }
 }
 
@@ -776,4 +842,117 @@ main.swiping { position: relative; z-index: 1; min-height: 100dvh; background: v
 .gym-rest span { flex: 1; color: var(--label-2); }
 .gym-rest b { font: var(--section); font-variant-numeric: tabular-nums; }
 .gym-actions:has(+ .gym-rest:not([hidden])) { margin-bottom: 64px; }
-@media (prefers-reduced-motion: reduce) { .gym-step:active { transform: none; } }
+#train:has(> .gym-rest:not([hidden])) { padding-bottom: 72px; } /* a pushed screen keeps its end clear of the pill */
+.gym-adj { min-width: 44px; height: 44px; font: var(--headline); color: var(--accent-text); font-variant-numeric: tabular-nums; transition: transform 100ms var(--out); }
+.gym-adj:active { transform: scale(.92); }
+.gym-rest:has(.gym-adj) { gap: 4px; }
+.gym-rest:has(.gym-adj) b { margin-right: 4px; }
+
+/* A set row: "Last 115 × 5" fills the set (its own target, over the row), the rest of the row opens the set sheet. */
+.row .gym-sub { overflow: visible; }
+.gym-last { position: relative; z-index: 1; margin: -6px -8px -11px; padding: 6px 8px 11px; font: inherit; color: var(--label-2); text-align: left; }
+.gym-last:active { color: var(--label); }
+.gym-val { flex: none; display: flex; align-items: center; gap: 12px; color: inherit; font: inherit; }
+.gym-val::after { content: ""; position: absolute; inset: 0; }
+/* A record: a small tinted capsule after the set's number; it pops in with the tick. */
+.gym-pr { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; background: var(--tint); color: var(--accent-text); font: var(--cap); vertical-align: 1px; }
+.just .gym-pr { animation: disc 280ms var(--pop); }
+/* An exercise's name opens its history and records. */
+.gym-ex-link { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; max-width: 100%; font: inherit; color: inherit; text-align: left; }
+.gym-ex-link .chev { width: 8px; height: 14px; }
+.gym-ex-link:active { opacity: .6; }
+h2.section:has(> .gym-ex-link) { margin: 18px 0 0; }
+.row .title.gym-link { color: var(--accent-text); }
+
+/* The exercise chart: one accent line on the surface, values on the right, dates under the ends. */
+.gym-chart-ctl { display: flex; gap: 8px; margin-top: 20px; }
+.gym-chart-ctl .gym-seg { margin-top: 0; }
+.gym-chart-ctl .gym-seg:first-child { flex: 3; }
+.gym-chart-ctl .gym-seg:last-child { flex: 2; }
+.gym-chart { margin: 12px 0 0; padding: 14px 14px 10px; background: var(--surface); border-radius: 24px; }
+.gym-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.gym-chart .grid { stroke: var(--separator); stroke-width: .5; }
+.gym-chart .line { fill: none; stroke: var(--accent-text); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.gym-chart .dot { fill: var(--surface); stroke: var(--accent-text); stroke-width: 2; }
+.gym-chart .dot.last { fill: var(--accent-text); }
+.gym-chart text { stroke: none; fill: var(--label-2); font: 11px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+.gym-chart figcaption { margin-top: 6px; }
+
+/* Edit plan: swipe a row left to remove it (a red fill shows under it), drag the grip to reorder. */
+.gym-plan > li { overflow: hidden; }
+.gym-plan .slide { position: relative; display: flex; align-items: center; background: var(--surface); touch-action: pan-y; }
+.gym-plan .slide .row { flex: 1; min-width: 0; padding-right: 4px; }
+.gym-grip { width: 44px; height: 52px; flex: none; display: grid; place-items: center; margin-right: 4px; color: var(--label-3); touch-action: none; }
+.gym-grip .glyph { width: 22px; height: 22px; }
+.gym-del { position: absolute; inset: 0; display: flex; align-items: center; justify-content: flex-end; padding: 0 22px; background: var(--destructive); color: var(--on-destructive); font: var(--headline); visibility: hidden; }
+.gym-plan li[data-dir] .gym-del { visibility: visible; }
+.gym-plan.dragging > li:not(.lifted) { transition: transform 200ms var(--drawer); }
+.gym-plan > li.lifted { z-index: 2; box-shadow: 0 6px 20px rgb(0 0 0 / .18); }
+.gym-plan > li.lifted::before { visibility: hidden; }
+.gym-plan > li.lifted + li::before { visibility: hidden; }
+/* White on the light theme's red; the dark theme's lighter red needs dark text for contrast (4.5:1+). */
+.gym-del { --on-destructive: #fff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .gym-del { --on-destructive: #1c0306; } }
+:root[data-theme="dark"] .gym-del { --on-destructive: #1c0306; }
+#train-sheet .gym-seg + .foot { margin: 8px 16px 0; }
+#train-sheet > * { flex-shrink: 0; } /* a long sheet (Add exercise) scrolls instead of squashing its fields */
+
+@media (prefers-reduced-motion: reduce) {
+  .gym-step:active, .gym-adj:active { transform: none; }
+  .just .gym-pr { animation: none; }
+  .gym-plan.dragging > li:not(.lifted) { transition: none; }
+}
+
+/* ---------- Food (food.js): one sheet, #food-sheet. Built on the design system: rows, .group, .btn, .chip, .seg, the switch and
+   Train's .gym-input/.gym-text fields. Only Food's own pieces are here; no new colour tokens. ---------- */
+#food-sheet > * { flex-shrink: 0; } /* the sheet is a flex column: nothing in it squashes, the sheet scrolls instead */
+.food .row .subtitle { white-space: normal; }
+.food .food-cap { margin: 4px 16px -8px; }
+.food-back { margin: 0 -7px 0 0; }
+.food-back svg { stroke: currentColor; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.food-notice { margin: -4px 16px 0; }
+.food-link { color: var(--accent-text); font: inherit; font-weight: 600; min-height: 44px; padding: 0 4px; flex: none; }
+.food-reset { align-self: flex-start; min-height: 32px; padding: 0; font: var(--subhead); font-weight: 600; }
+.food-sum { display: grid; gap: 14px; padding: 16px; border-radius: 24px; background: var(--raised); }
+.food-bar { display: grid; gap: 6px; width: 100%; text-align: left; }
+.food-bar:active .food-rail { opacity: .7; }
+.food-kcal { display: flex; align-items: baseline; gap: 6px; color: var(--label-2); font: var(--subhead); font-variant-numeric: tabular-nums; }
+.food-kcal b { font: var(--title1); color: var(--label); }
+.food-macros { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.food-line { display: flex; flex-direction: column; font: var(--foot); color: var(--label-2); font-variant-numeric: tabular-nums; }
+.food-line span:first-child { font: var(--cap); color: var(--label); }
+.food-rail { height: 6px; border-radius: 999px; background: var(--fill); overflow: hidden; }
+.food-rail i { display: block; height: 100%; width: calc(var(--p, 0) * 100%); border-radius: inherit; background: var(--accent-text); }
+.food-strip { list-style: none; display: flex; gap: 8px; overflow-x: auto; margin: 0 -16px; padding: 0 16px; scrollbar-width: none; scroll-padding: 16px; scroll-snap-type: x proximity; }
+.food-strip::-webkit-scrollbar { display: none; }
+.food-strip li { flex: none; min-width: 96px; display: grid; gap: 1px; padding: 10px 12px; border-radius: 16px; background: var(--raised); scroll-snap-align: start; }
+.food-strip .k { font: var(--caption); color: var(--label-2); }
+.food-strip .v { font: var(--headline); font-variant-numeric: tabular-nums; }
+.food-strip .na, .row .trail.na { color: var(--label-3); font-weight: 400; }
+.food-chips { display: flex; flex-wrap: wrap; column-gap: 8px; margin: -6px 0; }
+.food-chips .chip { max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; line-height: 32px; }
+.food-ways { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.food-ways label { position: relative; overflow: hidden; }
+.food-ways .glyph { width: 20px; height: 20px; color: currentColor; stroke-width: 1.75; }
+.food-hint { margin: -8px 16px 0; }
+.food-photo { display: block; width: 100%; max-height: 200px; object-fit: cover; border-radius: 24px; }
+.food-total { display: grid; gap: 8px; padding: 16px; border-radius: 24px; background: var(--raised); }
+.food-trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.food-trio > span { display: grid; font: var(--foot); color: var(--label-2); }
+.food-trio b { font: var(--headline); color: var(--label); font-variant-numeric: tabular-nums; }
+.food-item { gap: 8px; padding-right: 8px; }
+.food-name { font: var(--body); color: var(--label); text-align: left; overflow-wrap: anywhere; min-height: 24px; }
+.food-badge { display: inline-block; padding: 0 7px; margin-right: 2px; border-radius: 999px; background: var(--fill); font: var(--caption); color: var(--label-2); }
+.food-x { width: 36px; height: 44px; flex: none; display: grid; place-items: center; color: var(--label-3); }
+.food-x svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2.2; }
+.food-retype, .food-code { flex: 1; min-width: 0; min-height: 44px; padding: 0; }
+.food-named { flex: 2; min-height: 44px; padding: 0; text-align: right; }
+.food-micros > summary { list-style: none; display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 16px; font: var(--body); color: var(--accent-text); cursor: pointer; }
+.food-micros > summary::-webkit-details-marker { display: none; }
+.food-micros > summary::after { content: ""; width: 7px; height: 7px; border: solid var(--label-4); border-width: 0 2px 2px 0; transform: rotate(45deg); transition: transform 240ms var(--drawer); }
+.food-micros[open] > summary::after { transform: rotate(-135deg); }
+.food-danger { color: var(--destructive); align-self: center; }
+.food-seg { flex: none; width: 168px; }
+.food-seg[data-none] .thumb { opacity: 0; }
+.food-ways label:focus-within { outline: 2px solid var(--accent-text); outline-offset: 2px; } /* ?open=food:photo lands here */
+@media (prefers-reduced-motion: reduce) { .food-micros > summary::after { transition: none; } }

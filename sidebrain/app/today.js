@@ -22,7 +22,7 @@ export function withoutGreeting(line) {
 export const weightPercent = (t) => { const m = typeof t === "string" && t.match(/(\d{1,3})/); return m ? Number(m[1]) : null; };
 
 /** Moodle's copy of an assessment another source already tracks (same module and day) is left out. */
-function own(assessments) {
+export function own(assessments) {
   const key = (a) => `${a.module ?? ""}|${a.date ?? ""}`;
   const tracked = new Set(assessments.filter((a) => a.source !== "moodle").map(key));
   return assessments.filter((a) => a.source !== "moodle" || !tracked.has(key(a)));
@@ -321,11 +321,13 @@ export function upNext({ events = [], pings = [], tasks = [], assessments = [], 
   return rows.sort((x, y) => cmp(x.day, y.day) || (x.at ?? -Infinity) - (y.at ?? -Infinity) || cmp(x.title, y.title));
 }
 
-/** The Inbox: every ping whose fire time has come, newest first. Unread = no seenAt and not done. */
+/** The Inbox: every ping whose fire time has come, newest first, until it expires (contract §6, as Pings.inbox on the
+ *  Mac): one with its own data.expires (a nudge, event or room ping) leaves then, any other 2 days after it fired.
+ *  Unread = no seenAt and not done; the count (the badge) is the unread ones that fired today. */
 export function inbox(pings, now = new Date()) {
-  const rows = pings.map((p) => ({ p, at: fireAt(p) })).filter((x) => x.at && x.at <= now)
+  const rows = pings.map((p) => ({ p, at: fireAt(p) })).filter((x) => x.at && x.at <= now && now < (instant(x.p.data?.expires) ?? new Date(x.at.getTime() + 2 * 864e5)))
     .sort((a, b) => b.at - a.at || cmp(a.p.id, b.p.id)).map((x) => x.p);
-  return { rows, unread: rows.filter((p) => !p.user_data?.seenAt && p.user_data?.done !== true).length };
+  return { rows, unread: rows.filter((p) => !p.user_data?.seenAt && p.user_data?.done !== true && localDay(fireAt(p)) === localDay(now)).length };
 }
 
 /** Snooze choices still ahead of `now`, [label, Date]: 1 hour, 20:00 tonight and 08:00 tomorrow. */
@@ -350,6 +352,19 @@ export function ago(then, now = Date.now()) {
 
 const plainName = (s) => String(s ?? "").toLowerCase().replaceAll("&", " and ").split(/[^\p{L}\p{N}]+/u).filter(Boolean).join(" ");
 
+/** A lecture, seminar or workshop event, or one with a module code. */
+export const isClass = (e) => /lecture|seminar|workshop/i.test(text(e.data, "title") ?? e.title ?? "") || !!text(e.data, "code");
+/** The module row an event's title names, by full name, code or short name; null when none does. */
+export function moduleOfEvent(e, modules) {
+  const title = text(e.data, "title") ?? e.title ?? "", code = text(e.data, "code")?.toUpperCase();
+  const words = title.toUpperCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return modules.find((m) => {
+    const name = m.module ?? m.title ?? "";
+    return (code && text(m.data, "code")?.toUpperCase() === code) || (name && plainName(title).includes(plainName(name)))
+      || [text(m.data, "code"), text(m.data, "short")].some((x) => x && words.includes(x.toUpperCase()));
+  }) ?? null;
+}
+
 /** The class on now, as {module, lecture, label} ("BES L3"), or null: a lecture, seminar or workshop event (or one with a
  *  module code) from 15 minutes before it starts to its end, whose title names a module by full name, code or short name
  *  (TodayModel.lecture). The lecture is the module's one that day, else the one whose L/S number is in the title; the class
@@ -357,16 +372,10 @@ const plainName = (s) => String(s ?? "").toLowerCase().replaceAll("&", " and ").
 export function classNow(events, modules, lectures, now = new Date()) {
   const wait = (start) => (start <= now ? now - start : 1e12 + (start - now));
   const on = events.map((e) => ({ e, title: text(e.data, "title") ?? e.title ?? "", start: instant(e.data?.start), end: instant(e.data?.end) }))
-    .filter(({ e, title, start, end }) => start && !gone(e) && e.data?.allDay !== true && (/lecture|seminar|workshop/i.test(title) || text(e.data, "code"))
-      && start - 15 * 6e4 <= now && now <= (end ?? new Date(start.getTime() + 36e5)))
+    .filter(({ e, start, end }) => start && !gone(e) && isClass(e) && start - 15 * 6e4 <= now && now <= (end ?? new Date(start.getTime() + 36e5)))
     .sort((a, b) => wait(a.start) - wait(b.start));
   for (const { e, title, start } of on) {
-    const words = title.toUpperCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean), code = text(e.data, "code")?.toUpperCase();
-    const mod = modules.find((m) => {
-      const name = m.module ?? m.title ?? "";
-      return (code && text(m.data, "code")?.toUpperCase() === code) || (name && plainName(title).includes(plainName(name)))
-        || [text(m.data, "code"), text(m.data, "short")].some((x) => x && words.includes(x.toUpperCase()));
-    });
+    const words = title.toUpperCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean), mod = moduleOfEvent(e, modules);
     if (!mod) continue;
     const module = mod.module ?? mod.title, day = localDay(start), own = lectures.filter((l) => l.module === module);
     const said = title.match(/(lecture|session|seminar)\s*(\d+)/i);

@@ -49,7 +49,21 @@ export const PLAN = {
   },
 };
 export const KEYS = ["A", "B", "C", "D"];
-export const exerciseById = (id) => KEYS.flatMap((k) => PLAN.sessions[k].items).find((e) => e.id === id) ?? null;
+const inPlan = (plan, id) => KEYS.flatMap((k) => plan.sessions[k].items).find((e) => e.id === id) ?? null;
+/** An exercise by id: from this user's plan first (pass the profile), then the Autumn plan. */
+export const exerciseById = (id, profile = null) => inPlan(planOf(profile), id) ?? inPlan(PLAN, id);
+
+/** The plan with this user's edits (Edit plan): profile.plan[key] is that session's whole list, in order. Each item keeps
+ *  the Autumn plan's fields for its id (main, lower, inc, start, alts) under the edits, so every rule reads it as before. */
+export function planOf(profile) {
+  const own = profile?.plan;
+  if (!own || typeof own !== "object") return PLAN;
+  const sessions = {};
+  for (const k of KEYS) sessions[k] = Array.isArray(own[k])
+    ? { ...PLAN.sessions[k], items: own[k].filter((o) => o?.id).map((o) => ({ ...(inPlan(PLAN, o.id) ?? ex(o.id, o.name ?? o.id, 3, 8, 12)), ...o })) }
+    : PLAN.sessions[k];
+  return { ...PLAN, sessions };
+}
 
 /** Plan week 1 starts on PLAN.start (a Monday). Past the end the plan has run out and there is nothing to prescribe. */
 export const planWeek = (day) => Math.floor(daysBetween(PLAN.start, day) / 7) + 1;
@@ -57,16 +71,60 @@ export const planOver = (day) => day > PLAN.end;
 /** The plan's session for this weekday, or null on rugby and rest days. */
 export const sessionForDay = (day) => KEYS.find((k) => PLAN.sessions[k].day === weekday(day)) ?? null;
 
+/** The morning check-in's rugby answer for a day (Today's gym row "daily-YYYY-MM-DD"): "training" | "match" | "no", with
+ *  "rest" read as "no"; null when it wasn't asked or answered. */
+export function rugbyOn(day, rows = []) {
+  const r = rows.find((x) => x.id === `daily-${day}`)?.user_data?.rugby;
+  return r === "rest" ? "no" : ["training", "match", "no"].includes(r) ? r : null;
+}
+
+/** What the day is, for Train's hero and later Food's day type: {rugby, what, key}. `what` is "match", "training" or "rest"
+ *  from the check-in (a "no" counts only on a rugby or match weekday), else null. On a match day the plan's session drops. */
+export function dayPlan(day, rows = [], profile = {}) {
+  const rugby = rugbyOn(day, rows), wd = weekday(day);
+  const rugbyDay = wd === (profile?.matchDay ?? PLAN.matchDay) || (profile?.rugbyDays ?? [2, 6]).includes(wd);
+  const what = rugby === "match" ? "match" : rugby === "training" ? "training" : rugby === "no" && rugbyDay ? "rest" : null;
+  return { rugby, what, key: what === "match" ? null : sessionForDay(day) };
+}
+
 // ---- History ----
 
-/** Logged sessions, newest first by date then end time. */
-export const sessionsOf = (rows) => rows.filter((r) => r.data?.type === "session")
+/** Logged sessions, newest first by date then end time. A deleted one (user_data.deleted, so Undo can bring it back) is gone. */
+export const sessionsOf = (rows) => rows.filter((r) => r.data?.type === "session" && !r.deleted_at && !r.user_data?.deleted)
   .sort((a, b) => (a.date === b.date ? (b.data.end ?? 0) - (a.data.end ?? 0) : a.date < b.date ? 1 : -1));
+
+/** The id for an exercise by name: the Autumn plan's own when it has one (so history is shared), else one made from the name. */
+export const idFor = (name) => KEYS.flatMap((k) => PLAN.sessions[k].items).find((e) => e.name.toLowerCase() === name.trim().toLowerCase())?.id
+  ?? `you-ex-${name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "x"}`;
+
+/** "Update plan" on a swap: the new lift takes the old one's place, sets, reps, rest and role, with its own id and history
+ *  (no start load); the old lift becomes its first alternative, so it's one tap back. */
+export function swapInPlan(items, oldId, name) {
+  const id = idFor(name);
+  return items.map((e) => (e.id !== oldId ? e
+    : { ...e, id, name: name.trim(), start: null, note: "", alts: [e.name, ...(e.alts ?? []).filter((a) => a !== name.trim())] }));
+}
+
+/** "Update plan" during a session: the plan always takes the new lift (returned as `items`). Today moves to it only while
+ *  none of its sets are ticked; ticked sets were done as the old lift, so today stays a swap ("swap") and they never count
+ *  for either lift's load. Returns {items, live, today: "moved" | "swap"}; `live` is a new copy. */
+export function updateSwap(live, ei, name, items, sessions) {
+  const next = swapInPlan(items, live.items[ei].id, name), id = idFor(name), out = structuredClone(live), x = out.items[ei];
+  if (x.sets.some((s) => s.done)) { out.swaps[x.id] = name.trim(); return { items: next, live: out, today: "swap" }; }
+  delete out.swaps[x.id];
+  const last = lastTime(id, sessions), load = last ? Math.max(...last.sets.map((s) => num(s.load) ?? 0)) || null : null;
+  Object.assign(x, { id, name: name.trim(), note: "", up: false, alts: next.find((e) => e.id === id)?.alts ?? [] });
+  if (x.kind === "load") for (const s of x.sets) if (!s.done) s.load = load;
+  return { items: next, live: out, today: "moved" };
+}
+
+/** A session's sets: an edit made afterwards (user_data.sets, from History) wins over what was logged. */
+export const setsOf = (s) => s.user_data?.sets ?? s.data?.sets ?? [];
 
 /** The last time an exercise was done: {date, sets, deload}, sets being the ticked ones only. */
 export function lastTime(id, sessions) {
   for (const s of sessions) {
-    const sets = (s.data.sets ?? []).filter((x) => x.ex === id && x.done && !x.swap); // a swapped-in lift never moves the plan's load
+    const sets = setsOf(s).filter((x) => x.ex === id && x.done && !x.swap); // a swapped-in lift never moves the plan's load
     if (sets.length) return { date: s.date, sets, deload: !!s.data.deload };
   }
   return null;
@@ -112,12 +170,14 @@ export function phaseOf(day, profile = {}) {
 
 /** Today's prescription for one session: the exercises with sets, rep range and load, and a note for every rule that
  *  changed something (R4–R6), so no input is silently ignored. */
-export function prescribe(key, day, { sessions = [], profile = {}, recovery = null } = {}) {
-  const plan = PLAN.sessions[key], phase = phaseOf(day, profile), red = isRed(recovery);
+export function prescribe(key, day, { sessions = [], profile = {}, recovery = null, rugby = null } = {}) {
+  const plan = planOf(profile).sessions[key], phase = phaseOf(day, profile), red = isRed(recovery);
   const skip = new Set(profile.avoid ?? []), notes = [];
   if (phase === "deload") notes.push("Deload week: half the sets, same loads, two more reps in reserve.");
   if (phase === "light") notes.push("Light week: main lifts 2 × 3 at RPE 7, one set of Nordics and Copenhagens.");
   if (red) notes.push(`WHOOP recovery ${recovery}%: one set fewer on accessories${key === "D" ? ", and easy bike instead of intervals" : ""}. Main lifts unchanged.`);
+  const easy = rugby === "training"; // the check-in said rugby training today: no hard conditioning on top of it
+  if (easy && plan.items.some((e) => e.conditioning)) notes.push("Rugby training today: conditioning swapped for easy bike.");
   const items = [];
   for (const e of plan.items) {
     if (skip.has(e.id)) continue;
@@ -127,6 +187,7 @@ export function prescribe(key, day, { sessions = [], profile = {}, recovery = nu
     if (phase === "light") { sets = e.main ? 2 : 1; if (e.main) { lo = hi = 3; rir = "3"; } }
     if (red && !e.main) sets = Math.max(1, sets - 1);
     if (red && e.conditioning) { name = "Easy bike (recovery is red)"; sets = 1; lo = hi = 20; }
+    if (easy && e.conditioning) { name = "Easy bike"; sets = 1; lo = hi = 20; }
     const next = e.kind === "load" ? nextLoad(e, sessions, day, profile.starts) : null;
     if (next?.why === "gap") notes.push(`${e.name}: over 2 weeks since you last did it, so 10% lighter.`);
     items.push({ ...e, name, sets, lo, hi, rir, load: next?.load ?? null, up: next?.why === "up" });
@@ -135,11 +196,15 @@ export function prescribe(key, day, { sessions = [], profile = {}, recovery = nu
 }
 
 /** R2 and R3 as plain warnings for the session about to start. `doneToday` are today's logged sessions. */
-export function warnings(key, day, now, profile = {}, doneToday = []) {
+export function warnings(key, day, now, profile = {}, doneToday = [], rows = []) {
   const out = [], match = profile.matchDay ?? PLAN.matchDay, wd = weekday(day);
-  const heavyLegs = PLAN.sessions[key].items.some((e) => e.main && e.lower);
-  if (heavyLegs && (wd === match || wd === (match + 1) % 7))
+  const heavyLegs = planOf(profile).sessions[key].items.some((e) => e.main && e.lower);
+  // R2: a check-in answer for today or yesterday wins over the weekday; without one the match weekday counts.
+  const isMatch = (d, weekdayRule) => { const a = rugbyOn(d, rows); return a ? a === "match" : weekdayRule; };
+  if (heavyLegs && (isMatch(day, wd === match) || isMatch(addDays(day, -1), wd === (match + 1) % 7)))
     out.push("Heavy legs within 48 h of the match. Do the light session today and keep this one for Sunday.");
+  if (heavyLegs && rugbyOn(day, rows) === "training")
+    out.push("Rugby training today. Heavy legs on top of it is a lot: go light, or move this session.");
   const conditioning = key === "D";
   for (const s of doneToday) {
     const other = s.data.key === "D";
@@ -147,6 +212,66 @@ export function warnings(key, day, now, profile = {}, doneToday = []) {
       out.push("Less than 3 hours since your last session. Lift first and keep conditioning 3 hours apart where you can.");
   }
   return [...new Set(out)];
+}
+
+// ---- Records (research: Hevy, Fitbod): one PR rule for the live tick, History and the exercise screen ----
+// A ticked set is a PR when it beats every set of that exercise before it on weight, on e1RM, or on reps at a weight done
+// before. The first time is the baseline, never a PR. Swapped-in sets are another lift, so they never count.
+
+const counts = (x) => !!x?.done && !x.swap && (num(x.reps) ?? 0) > 0;
+export const best = () => ({ n: 0, load: 0, e1: 0, at: {} });
+export function beats(b, x) {
+  if (!b.n || !counts(x)) return false;
+  const load = num(x.load) ?? 0, e = e1rm(load, x.reps, x.rir);
+  return load > b.load || (e != null && e > b.e1) || (b.at[load] != null && x.reps > b.at[load]);
+}
+export function absorb(b, x) {
+  if (!counts(x)) return b;
+  const load = num(x.load) ?? 0;
+  b.n++; b.load = Math.max(b.load, load); b.e1 = Math.max(b.e1, e1rm(load, x.reps, x.rir) ?? 0); b.at[load] = Math.max(b.at[load] ?? 0, x.reps);
+  return b;
+}
+/** The best so far for one exercise over these sessions. */
+export const bestOf = (id, sessions) => sessions.reduce((b, s) => { for (const x of setsOf(s)) if (x.ex === id) absorb(b, x); return b; }, best());
+
+/** Every PR in the log as "sessionId:setIndex", walking the sessions oldest first (sessions come newest first). The first
+ *  session of an exercise is its baseline, so its later sets beating its first never count. */
+export function prsOf(sessions) {
+  const bests = {}, out = new Set();
+  for (const s of [...sessions].reverse()) {
+    const had = new Set(Object.keys(bests).filter((k) => bests[k].n));
+    setsOf(s).forEach((x, i) => {
+      const b = (bests[x.ex] ??= best());
+      if (had.has(x.ex) && beats(b, x)) out.add(`${s.id}:${i}`);
+      absorb(b, x);
+    });
+  }
+  return out;
+}
+
+/** One exercise across the log, oldest first: each session's counted sets, top weight, best e1RM and volume (kg × reps). */
+export function exerciseLog(id, sessions) {
+  return [...sessions].reverse().flatMap((s) => {
+    const sets = setsOf(s).filter((x) => x.ex === id && counts(x));
+    if (!sets.length) return [];
+    const e1 = sets.map((x) => e1rm(x.load, x.reps, x.rir)).filter((v) => v != null);
+    return [{ id: s.id, date: s.date, sets, top: Math.max(...sets.map((x) => num(x.load) ?? 0)), e1: e1.length ? Math.max(...e1) : null,
+      volume: Math.round(sets.reduce((a, x) => a + (num(x.load) ?? 0) * x.reps, 0)) }];
+  });
+}
+
+/** Records from an exerciseLog: heaviest set, best e1RM, best set and session volume, and the heaviest weight at each rep count. */
+export function records(log) {
+  const sets = log.flatMap((l) => l.sets.map((x) => ({ load: num(x.load) ?? 0, reps: x.reps, rir: x.rir, date: l.date })));
+  if (!sets.length) return null;
+  const top = (f) => sets.reduce((a, x) => (f(x) > f(a) ? x : a));
+  const heaviest = top((x) => x.load * 1000 + x.reps), bestSet = top((x) => x.load * x.reps);
+  const e1 = log.filter((l) => l.e1 != null).reduce((a, l) => (!a || l.e1 > a.e1 ? l : a), null);
+  const session = log.reduce((a, l) => (l.volume > a.volume ? l : a));
+  const at = {};
+  for (const x of sets) if (x.reps <= 12 && (!at[x.reps] || x.load > at[x.reps].load)) at[x.reps] = x;
+  return { heaviest, e1: e1 && { value: e1.e1, date: e1.date }, set: { ...bestSet, volume: Math.round(bestSet.load * bestSet.reps) },
+    session: { volume: session.volume, date: session.date }, at: Object.values(at).sort((a, b) => a.reps - b.reps), mostReps: top((x) => x.reps) };
 }
 
 /** How a session left you, asked when it's finished: 1 Fine, 2 Tired, 3 Wrecked. */
@@ -201,7 +326,7 @@ export function scaleItem(item, grams) {
   return { ...item, base, grams: g, protein_g: Math.round(base.protein_g * f), kcal: Math.round(base.kcal * f) };
 }
 
-export const dayFood = (meals, day) => meals.filter((m) => m.date === day).flatMap((m) => m.data.items ?? [])
+export const dayFood = (meals, day) => meals.filter((m) => m.date === day && !m.user_data?.gone).flatMap((m) => m.user_data?.items ?? m.data?.items ?? [])
   .reduce((t, i) => ({ protein: t.protein + (i.protein_g || 0), kcal: t.kcal + (i.kcal || 0) }), { protein: 0, kcal: 0 });
 
 const FOOD_RULES = "You estimate food from a photo and the person's note. List each food separately with its cooked weight in grams, protein in grams and kcal. "

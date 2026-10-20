@@ -1,28 +1,41 @@
 // The Train tab: an optional plugin, off until switched on in the Account sheet (docs/(C) Gym plugin research.md §1, §7).
 // Built on the shell's design system (web/(C) Design system.md): the Today-style hero answers "what now?", inset-grouped
 // lists below it, the shell's sheet, Undo toast and folds. It owns #train and #train-sheet (one sheet, one mode at a time:
-// a set, an exercise's menu, swap, another session, finish, bodyweight, food). The rules live in gym.js.
-import { PLAN, KEYS, sessionForDay, sessionsOf, prescribe, warnings, deloadOffer, week, weightTrend, startFrom, e1rm, lastTime,
-         planWeek, scaleItem, dayFood, foodRequest, parseFood, whoopFor, PROTEIN_TARGET, phaseOf, exerciseById, FEEL, WRECKED } from "./gym.js";
+// a set, an exercise's menu, swap, another session, finish, bodyweight, an exercise in the plan). Food is food.js (ctx.food). The rules live in gym.js.
+// History, a session, an exercise and Edit plan are pushed over the main screen; the shell's back button pops them (depth/back).
+import { PLAN, KEYS, sessionForDay, sessionsOf, prescribe, warnings, deloadOffer, week, weightTrend, startFrom, lastTime,
+         planWeek, whoopFor, phaseOf, exerciseById, FEEL, WRECKED,
+         planOf, setsOf, prsOf, bestOf, beats, absorb, exerciseLog, records, idFor, updateSwap, dayPlan } from "./gym.js";
 import { todayString, addDays } from "./sm2.js";
 import { TICK } from "./notes.js";
 
 let ctx = null;                  // app.js: helpers, the outbox, the client and the shell's components (see train.mount in app.js)
+/** The check-in rows: the shell's copy (updated the moment Ricky taps) over whatever the last gym fetch brought. */
+const dayRows = () => { if (!ctx?.daily) return rows; const d = ctx.daily(), ids = new Set(d.map((r) => r.id)); return rows.filter((r) => !ids.has(r.id)).concat(d); };
 let rows = [];                   // gym items: this phone's copy, merged with the server's
 let live = null;                 // the session in progress (kept in localStorage, so a locked phone or a reload loses nothing)
 let editing = false, status = "", whoop = { connected: null, recovery: null, day: "" };
 let sheet = null;                // what #train-sheet shows: {mode, ...}
-let food = { items: [], note: "", busy: false, error: "", photo: null };
 let just = "";                   // the tick that was just pressed, so only it plays the pop
 let jwt = null, restTimer = null, quietTimer = null;
+let nav = [], homeY = 0;         // pushed screens: {s: "history" | "session" | "exercise" | "plan", id?, key?, y?}
+let chartM = 0, chartR = 1;      // the exercise chart: Weight | e1RM | Volume, and 4W | All
+let wake = null;                 // the Screen Wake Lock while a session runs (a promise of the lock)
+let noClick = 0;                 // a swipe or drag just ended: swallow the click it makes
 
 const $ = (id) => document.getElementById(id);
+const DRAWER = "cubic-bezier(.32,.72,0,1)";
 const esc = (s) => ctx.esc(String(s ?? ""));
 const num = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
 const kg = (x) => (x == null ? "" : `${num(x)} kg`);
 const profileRow = () => rows.find((r) => r.id === "gym-profile") ?? null;
 const profile = () => profileRow()?.user_data ?? null;
 const of = (type) => rows.filter((r) => r.data?.type === type && !r.deleted_at);
+const rowById = (id) => rows.find((r) => r.id === id) ?? null;
+const exOf = (id) => exerciseById(id, profile());
+/** An exercise's name: as the session logged it, else from the plan, else from any session that logged it. */
+const exName = (id, s = null) => s?.data?.names?.[id] ?? exOf(id)?.name ?? sessionsOf(rows).map((x) => x.data.names?.[id]).find(Boolean) ?? "Exercise";
+const redraw = () => { const el = $("train"); if (el) el._html = null; ctx.rerender(); };
 
 export function mount(c) {
   ctx = c;
@@ -33,14 +46,21 @@ export function mount(c) {
   document.body.append(dlg);
   dlg.innerHTML = sheetHead("Train"); // the gestures need a head to drag by; it is redrawn on every open
   ctx.sheetGestures(dlg);
-  dlg.addEventListener("close", () => { sheet = null; });
+  dlg.addEventListener("close", () => { // a past set or a plan exercise is edited on a copy and saved once, here
+    const done = sheet?.dirty && sheet;
+    sheet = null;
+    if (done?.row && rowById(done.row)) { patch(rowById(done.row), { sets: done.sets }); ctx.rerender(); }
+    if (done?.mode === "plan-ex") savePlan(done.key, done.items);
+  });
   for (const el of [$("train"), dlg]) {
     el.addEventListener("click", click);
     el.addEventListener("change", change);
     el.addEventListener("input", input);
   }
   $("sheet")?.addEventListener("click", click); // Account → Train rows (accountRows)
+  planGestures($("train"));
   document.addEventListener("visibilitychange", restVisibility);
+  awake();
   const link = new URLSearchParams(location.search).get("whoop");
   if (link) status = link === "connected" ? "WHOOP connected." : "WHOOP didn’t connect. Try again.";
   if (live?.rest) { tick(); quietTimer = setTimeout(restQuiet, Math.max(0, live.rest.until - Date.now() - 10_000)); }
@@ -50,6 +70,7 @@ export function mount(c) {
 /** Today's Gym event opens the Train tab while Train is on; false (do nothing) when it's off, so the row keeps its own tap. */
 export function openToday() {
   if (!ctx?.on()) return false;
+  nav = [];
   ctx.tab();
   scrollTo(0, 0);
   return true;
@@ -150,6 +171,7 @@ function restQuiet() {
   if (live?.rest?.server && document.visibilityState === "visible") { restWrite(null); live.rest.server = false; saveLive(); }
 }
 function restVisibility() {
+  if (document.visibilityState === "visible") awake(); // iOS drops the wake lock whenever the page is hidden
   const r = live?.rest, left = r ? r.until - Date.now() : 0;
   if (!r || left <= 0) return;
   if (document.visibilityState === "hidden" && !r.server && left > 3000) { restWrite(r.until, r.body); r.server = true; }
@@ -162,7 +184,8 @@ function restVisibility() {
 export function render() {
   const el = $("train");
   if (!el || !ctx) return;
-  const html = !profile() || editing ? setup() : live ? liveScreen() : home();
+  const sc = profile() && !editing ? nav.at(-1) : null;
+  const html = sc ? pushed(sc) + (live ? restPill() : "") : !profile() || editing ? setup() : live ? liveScreen() : home();
   if (el._html !== html) el.innerHTML = el._html = html;
   just = "";
   if (profile() && !live) whoopStatus();
@@ -183,19 +206,20 @@ const dayName = (day, opts = { weekday: "long" }) => new Date(day + "T12:00").to
 const phaseName = (phase) => ({ build: "Build", deload: "Deload", light: "Light week" }[phase] ?? "");
 
 /** The hero for the plan: what now, in the Today hero's grid. */
-function planHero(today, sessions, p, phase) {
-  const key = sessionForDay(today);
+function planHero(today, sessions, p, phase, dp) {
+  const key = dp.key;
   if (phase === "over") return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Autumn plan</p><span></span><h2>Plan finished</h2></div>
     <p class="where gym-hero-line">It ended on 12 Dec. Write the next block, then load it here.</p></section>`;
   if (!key) {
     const wd = new Date().getDay(), next = KEYS.map((k) => ({ k, d: [1, 2, 3, 4, 5, 6, 7].map((n) => addDays(today, n)).find((d) => sessionForDay(d) === k) }))
       .sort((a, b) => (a.d < b.d ? -1 : 1))[0];
-    const what = wd === p.matchDay ? "Match day" : (p.rugbyDays ?? [2, 6]).includes(wd) ? "Rugby training" : "Rest day";
+    const what = { match: "Match day", training: "Rugby training", rest: "Rest day" }[dp.what]
+      ?? (wd === p.matchDay ? "Match day" : (p.rugbyDays ?? [2, 6]).includes(wd) ? "Rugby training" : "Rest day");
     return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Today</p><p class="k r">Next</p>
       <h2>${what}</h2><b class="fig">${dayName(next.d, { weekday: "short" })}</b>
       <p class="where">Nothing in the gym</p><span class="range">${esc(PLAN.sessions[next.k].name)}</span></div></section>`;
   }
-  const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery });
+  const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery, rugby: dp.rugby });
   const lead = rx.items.find((e) => e.main && e.load != null) ?? rx.items.find((e) => e.load != null);
   return `<section class="hero" aria-label="Training now"><div class="hgrid"><p class="k">Today · ${phaseName(rx.phase)}</p><p class="k r">${lead ? esc(lead.name) : ""}</p>
     <h2${rx.name.length > 24 ? ` class="long"` : ""}>${esc(rx.name)}</h2><b class="fig">${lead ? kg(lead.load) : ""}</b>
@@ -205,18 +229,19 @@ function planHero(today, sessions, p, phase) {
 
 function home() {
   const today = todayString(), sessions = sessionsOf(rows), p = profile(), phase = phaseOf(today, p);
-  const key = sessionForDay(today), wk = week(today, sessions);
-  let out = ctx.head("Train", phase === "over" ? "" : `Week ${planWeek(today)}`) + planHero(today, sessions, p, phase);
+  const dp = dayPlan(today, dayRows(), p), key = dp.key, wk = week(today, sessions);
+  let out = ctx.head("Train", phase === "over" ? "" : `Week ${planWeek(today)}`) + planHero(today, sessions, p, phase, dp);
   if (status) out += `<p class="foot mt-12">${esc(status)}</p>`;
   if (key && phase !== "over") {
-    const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery });
-    const warn = warnings(key, today, Date.now(), p, sessions.filter((s) => s.date === today));
+    const rx = prescribe(key, today, { sessions, profile: p, recovery: whoop.recovery, rugby: dp.rugby });
+    const warn = warnings(key, today, Date.now(), p, sessions.filter((s) => s.date === today), dayRows());
     for (const w of [...warn, ...rx.notes]) out += `<p class="foot mt-12${warn.includes(w) ? " warn" : ""}">${esc(w)}</p>`;
-    out += `<ul class="group flat gym-folds mt-20">${ctx.fold("train-today", "Exercises", rx.items.length, rx.items.map((e) => `<li><div class="row"><span class="text">
-      <span class="title">${esc(e.name)}</span><span class="subtitle">${e.sets} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}</span></span>
-      ${e.load != null ? `<span class="trail">${kg(e.load)}${e.up ? " ↑" : ""}</span>` : ""}</div></li>`).join(""))}</ul>`;
+    out += `<ul class="group flat gym-folds mt-20">${ctx.fold("train-today", "Exercises", rx.items.length, rx.items.map((e) => ctx.row({ tag: "button",
+      attrs: `data-g="open-ex" data-id="${esc(e.id)}"`, title: esc(e.name), sub: `${e.sets} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}`,
+      trail: e.load != null ? `${kg(e.load)}${e.up ? " ↑" : ""}` : "", chev: true })).join(""))}</ul>`;
   }
-  if (phase !== "over") out += `<ul class="group flat mt-12">${ctx.row({ tag: "button", attrs: `data-g="others"`, title: key ? "Do a different session" : "Do a session anyway", chev: true })}</ul>`;
+  if (phase !== "over") out += `<ul class="group flat mt-12">${ctx.row({ tag: "button", attrs: `data-g="others"`, title: key ? "Do a different session" : "Do a session anyway", chev: true })}
+    ${ctx.row({ tag: "button", attrs: `data-g="plan"`, title: "Edit plan", chev: true })}</ul>`;
   if (deloadOffer(sessions, today, p)) out += `<ul class="group mt-12">${ctx.row({ tag: "button", attrs: `data-g="deload"`, lead: ctx.ICON.sunrise,
     title: "Take a deload week", sub: "The last two sessions felt wrecked" })}</ul>`;
   out += `<h2 class="section">This week · <span class="count">${wk.count} of ${p.target ?? 4}</span></h2><ul class="group">${wk.slots.map((s) => ctx.row({
@@ -229,20 +254,277 @@ function home() {
 
 /** Bodyweight and food: one group, today's value trailing, each opening its sheet. */
 function log(today) {
-  const w = of("weight").find((r) => r.date === today)?.user_data?.kg, protein = dayFood(of("meal"), today).protein;
+  const w = of("weight").find((r) => r.date === today)?.user_data?.kg, protein = ctx.food?.today().protein ?? 0;
   return `<h2 class="section">Log</h2><ul class="group flat">
     ${ctx.row({ tag: "button", attrs: `data-g="weight"`, title: "Bodyweight", trail: typeof w === "number" ? kg(w) : "Add", chev: true })}
     ${ctx.row({ tag: "button", attrs: `data-g="food"`, title: "Food", trail: protein ? `${protein} g protein` : "Add", chev: true })}</ul>`;
 }
 
+/** The last three sessions, each opening its detail, and the full History. */
 function history(sessions) {
   if (!sessions.length) return "";
-  return `<h2 class="section">Recent</h2><ul class="group flat">${sessions.slice(0, 5).map((s) => {
-    const w = s.user_data?.whoop, top = (s.data.sets ?? []).filter((x) => x.done && x.load > 0 && !x.swap).map((x) => e1rm(x.load, x.reps, x.rir) ?? 0);
-    return ctx.row({ title: esc(s.title), sub: dayName(s.date, { weekday: "short", day: "numeric", month: "short" })
-      + `${top.length ? ` · best e1RM ${Math.max(...top)} kg` : ""}${WRECKED[s.data.wrecked - 1] ? ` · ${WRECKED[s.data.wrecked - 1]}` : ""}`,
-      trail: w?.strain != null ? `Strain ${w.strain.toFixed(1)}` : "" });
-  }).join("")}</ul>`;
+  const prs = prsOf(sessions);
+  return `<h2 class="section">History</h2><ul class="group flat">${sessions.slice(0, 3).map((s) => sessionRow(s, prs)).join("")}
+    ${ctx.row({ tag: "button", attrs: `data-g="history"`, title: "All sessions", trail: String(sessions.length), chev: true })}</ul>`;
+}
+
+const dur = (s) => (s.data.end > s.data.start ? `${Math.max(1, Math.round((s.data.end - s.data.start) / 60000))} min` : "");
+const dateShort = (day) => dayName(day, { day: "numeric", month: "short" });
+const PR = `<span class="gym-pr">PR</span>`;
+/** A logged set in words: "117.5 kg × 5", "8 reps", "15 s". */
+const setText = (kind, x, unit) => (kind === "load" ? `${x.load == null ? "–" : num(x.load)} kg × ${x.reps ?? "–"}` : kind === "time" ? `${x.reps ?? "–"} ${unit ?? "s"}` : `${x.reps ?? "–"} reps`);
+
+function sessionRow(s, prs) {
+  const n = setsOf(s).filter((_, i) => prs.has(`${s.id}:${i}`)).length, w = s.user_data?.whoop;
+  return ctx.row({ tag: "button", attrs: `data-g="open-session" data-id="${esc(s.id)}"`, title: esc(s.title),
+    sub: [dayName(s.date, { weekday: "short", day: "numeric", month: "short" }), dur(s), n ? `${n} PR${n > 1 ? "s" : ""}` : "", WRECKED[s.data.wrecked - 1]].filter(Boolean).join(" · "),
+    trail: w?.strain != null ? `Strain ${w.strain.toFixed(1)}` : "", chev: true });
+}
+
+// ---------- Pushed screens ----------
+
+export const depth = () => (profile() && !editing ? nav.length : 0);
+/** The bar's title while a screen is pushed. */
+export function title() {
+  const sc = depth() ? nav.at(-1) : null;
+  return !sc ? "Train" : sc.s === "history" ? "History" : sc.s === "plan" ? "Edit plan" : sc.s === "session" ? rowById(sc.id)?.title ?? "Session" : exName(sc.id);
+}
+/** Push and pop as the shell does it: the page slides 32 px and fades in over 280 ms on the drawer curve. */
+function slide(dir, change) {
+  change();
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches)
+    $("train").animate([{ opacity: 0, transform: `translateX(${dir === "push" ? 32 : -32}px)` }, { opacity: 1, transform: "none" }], { duration: 280, easing: DRAWER });
+}
+function go(screen) {
+  if (nav.length) nav.at(-1).y = scrollY; else homeY = scrollY;
+  slide("push", () => { nav.push(screen); ctx.rerender(); scrollTo(0, 0); });
+}
+/** The Train tab tapped again: back to its main screen. */
+export function reset() { nav = []; }
+export function back() {
+  if (!nav.length) return;
+  slide("pop", () => { nav.pop(); ctx.rerender(); scrollTo(0, nav.at(-1)?.y ?? homeY); });
+}
+
+const pushed = (sc) => (sc.s === "history" ? historyScreen() : sc.s === "session" ? sessionScreen(sc.id) : sc.s === "exercise" ? exerciseScreen(sc.id) : planScreen(sc.key));
+
+function historyScreen() {
+  const sessions = sessionsOf(rows), prs = prsOf(sessions);
+  if (!sessions.length) return `${ctx.head("History")}<p class="foot mt-12">Finished sessions show here.</p>`;
+  let out = ctx.head("History", `${sessions.length} session${sessions.length > 1 ? "s" : ""}`), month = "";
+  for (const s of sessions) {
+    const m = dayName(s.date, { month: "long", year: "numeric" });
+    if (m !== month) out += `${month ? "</ul>" : ""}<p class="caption-h">${m}</p><ul class="group flat">`;
+    month = m;
+    out += sessionRow(s, prs);
+  }
+  return `${out}</ul>`;
+}
+
+/** One session: its ticked sets by exercise (tap one to fix it), Repeat, and Delete with Undo. */
+function sessionScreen(id) {
+  const s = rowById(id);
+  if (!s || s.user_data?.deleted) return `${ctx.head("Session")}<p class="foot mt-12">This session was deleted.</p>`;
+  const prs = prsOf(sessionsOf(rows)), groups = [];
+  setsOf(s).forEach((x, i) => {
+    if (!x.done) return;
+    const k = `${x.ex}|${x.swap ?? ""}`;
+    let g = groups.find((y) => y.k === k);
+    if (!g) groups.push(g = { k, ex: x.ex, swap: x.swap, sets: [] });
+    g.sets.push([x, i]);
+  });
+  const w = s.user_data?.whoop;
+  let out = ctx.head(s.title, [dayName(s.date, { weekday: "long", day: "numeric", month: "long" }), dur(s), WRECKED[s.data.wrecked - 1], w?.strain != null ? `Strain ${w.strain.toFixed(1)}` : ""].filter(Boolean).join(" · "));
+  if (!groups.length) out += `<p class="foot mt-12">No sets were ticked.</p>`;
+  for (const g of groups) {
+    const e = exOf(g.ex), kind = e?.kind ?? "load";
+    out += g.swap ? `<h2 class="section">${esc(g.swap)}</h2><p class="foot">In place of ${esc(exName(g.ex, s))}</p>`
+      : `<h2 class="section"><button class="gym-ex-link" type="button" data-g="open-ex" data-id="${esc(g.ex)}">${esc(exName(g.ex, s))}${ctx.ICON.chev}</button></h2>`;
+    out += `<ul class="group flat">${g.sets.map(([x, i], n) => ctx.row({ tag: "button", attrs: `data-g="past-set" data-id="${esc(s.id)}" data-i="${i}"`,
+      title: `Set ${n + 1}${prs.has(`${s.id}:${i}`) ? PR : ""}`, sub: kind === "load" && x.rir != null ? `RIR ${x.rir}` : "", trail: esc(setText(kind, x, e?.unit)), chev: true })).join("")}</ul>`;
+  }
+  return `${out}<div class="gym-actions">${!live && PLAN.sessions[s.data.key] ? `<button class="btn primary" type="button" data-g="start" data-key="${s.data.key}">Repeat this session</button>` : ""}
+    <button class="btn plain gym-danger" type="button" data-g="del-session" data-id="${esc(s.id)}">Delete session</button></div>`;
+}
+
+/** Runs of the same weight: "117.5 kg: 5, 5, 4 · 120 kg: 3". */
+function setsLine(sets, kind) {
+  if (kind !== "load") return sets.map((x) => x.reps).join(", ");
+  const runs = [];
+  for (const x of sets) { const l = num(x.load ?? 0); if (runs.at(-1)?.l === l) runs.at(-1).r.push(x.reps); else runs.push({ l, r: [x.reps] }); }
+  return runs.map((r) => `${r.l} kg: ${r.r.join(", ")}`).join(" · ");
+}
+
+/** One exercise: the records in the hero, a chart, the records list and every session that had it. */
+function exerciseScreen(id) {
+  const e = exOf(id), name = exName(id), kind = e?.kind ?? "load", log = exerciseLog(id, sessionsOf(rows)), r = records(log);
+  let out = ctx.head(name, e?.note ?? "");
+  if (!r) return `${out}<p class="foot mt-12">Nothing logged yet. Tick a set of it in a session and it shows here.</p>`;
+  const last = log.at(-1), n = log.length, big = (v) => v.toLocaleString("en-GB");
+  if (kind === "load") {
+    out += `<section class="hero" aria-label="Records"><div class="hgrid"><p class="k">Heaviest</p><p class="k r">Best e1RM</p>
+      <h2>${num(r.heaviest.load)} kg × ${r.heaviest.reps}</h2><b class="fig">${r.e1 ? `${num(r.e1.value)} kg` : "–"}</b>
+      <p class="where">Last ${dateShort(last.date)}</p><span class="range">${n} session${n > 1 ? "s" : ""}</span></div></section>
+      <div class="gym-chart-ctl">${seg("chart-m", chartM, ["Weight", "e1RM", "Volume"], "Chart")}${seg("chart-r", chartR, ["4W", "All"], "Range")}</div>
+      <figure class="gym-chart" id="gym-chart">${chart(log)}</figure>
+      <h2 class="section">Records</h2><ul class="group flat">
+      ${ctx.row({ title: "Heaviest", sub: dateShort(r.heaviest.date), trail: `${num(r.heaviest.load)} kg × ${r.heaviest.reps}` })}
+      ${r.e1 ? ctx.row({ title: "Best e1RM", sub: dateShort(r.e1.date), trail: `${num(r.e1.value)} kg` }) : ""}
+      ${ctx.row({ title: "Best set volume", sub: `${num(r.set.load)} kg × ${r.set.reps}`, trail: `${big(r.set.volume)} kg` })}
+      ${ctx.row({ title: "Best session volume", sub: dateShort(r.session.date), trail: `${big(r.session.volume)} kg` })}
+      ${r.at.map((x) => ctx.row({ title: `Best at ${x.reps} rep${x.reps > 1 ? "s" : ""}`, sub: dateShort(x.date), trail: `${num(x.load)} kg` })).join("")}</ul>`;
+  } else {
+    out += `<h2 class="section">Records</h2><ul class="group flat">${ctx.row({ title: kind === "time" ? "Longest" : "Most reps", sub: dateShort(r.mostReps.date),
+      trail: esc(setText(kind, r.mostReps, e?.unit)) })}</ul>`;
+  }
+  return `${out}<h2 class="section">History</h2><ul class="group flat">${[...log].reverse().map((l) => ctx.row({ tag: "button",
+    attrs: `data-g="open-session" data-id="${esc(l.id)}"`, title: dayName(l.date, { weekday: "short", day: "numeric", month: "short" }),
+    sub: esc(setsLine(l.sets, kind)), trail: kind === "load" && l.e1 ? `${num(l.e1)} kg` : "", chev: true })).join("")}</ul>
+    ${kind === "load" ? `<p class="foot mt-12">e1RM estimates a one-rep max from weight, reps and reps in reserve (Epley). It skips sets over 12 reps.</p>` : ""}`;
+}
+
+/** The chart: one line per session, its value on the right axis; dates under the ends. */
+function chart(log) {
+  const key = ["top", "e1", "volume"][chartM], what = ["Top weight", "Best e1RM", "Volume"][chartM];
+  const from = chartR === 0 ? addDays(todayString(), -27) : "";
+  const pts = log.filter((l) => l.date >= from && l[key] > 0).map((l) => ({ d: l.date, v: l[key] }));
+  if (!pts.length) return `<p class="foot">${chartR === 0 ? "Nothing in the last 4 weeks." : "No weights logged yet."}</p>`;
+  const W = 340, H = 168, L = 6, R = 44, T = 10, B = 26, t = (d) => Date.parse(d + "T12:00");
+  const t0 = t(pts[0].d), t1 = t(pts.at(-1).d);
+  // Gridlines on round numbers: the smallest 1–2–2.5–5 step that covers the range in two.
+  const vmin = Math.min(...pts.map((p) => p.v)), vmax = Math.max(...pts.map((p) => p.v)), raw = Math.max(vmax - vmin, vmax * 0.04) / 2;
+  const mag = 10 ** Math.floor(Math.log10(raw)), step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((x) => x >= raw);
+  let lo = Math.floor(vmin / step) * step, hi = lo + 2 * step;
+  if (hi < vmax) hi = Math.ceil(vmax / step) * step;
+  if (lo === vmin && vmin - step >= 0 && hi - lo < 3 * step) { lo -= step; } // keep the first point off the bottom edge
+  const x = (d) => (t1 === t0 ? (W - R) / 2 : L + 6 + ((t(d) - t0) / (t1 - t0)) * (W - R - L - 12));
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const label = (v) => (v >= 1000 ? `${num(Math.round(v / 100) / 10)}k` : num(v));
+  const ticks = Array.from({ length: Math.round((hi - lo) / step) + 1 }, (_, i) => lo + i * step);
+  const grid = ticks.map((v) => `<line class="grid" x1="0" x2="${W - R + 6}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>
+    <text x="${W}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${label(v)}</text>`).join("");
+  const path = pts.map((p, i) => `${i ? "L" : "M"}${x(p.d).toFixed(1)} ${y(p.v).toFixed(1)}`).join("");
+  const dots = pts.map((p, i) => `<circle class="dot${i === pts.length - 1 ? " last" : ""}" cx="${x(p.d).toFixed(1)}" cy="${y(p.v).toFixed(1)}" r="${i === pts.length - 1 ? 4.5 : 3.5}"/>`).join("");
+  const a = pts[0], z = pts.at(-1), unit = (v) => `${num(Math.round(v * 10) / 10)} kg`;
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${what}: ${unit(a.v)} on ${dateShort(a.d)}${pts.length > 1 ? ` to ${unit(z.v)} on ${dateShort(z.d)}, ${pts.length} sessions` : ""}">
+    ${grid}<path class="line" d="${path}"/>${dots}
+    <text x="${x(a.d).toFixed(1)}" y="${H - 6}" text-anchor="${pts.length > 1 ? "start" : "middle"}">${dateShort(a.d)}</text>
+    ${pts.length > 1 ? `<text x="${x(z.d).toFixed(1)}" y="${H - 6}" text-anchor="end">${dateShort(z.d)}</text>` : ""}</svg>
+    <figcaption class="foot">${what} per session, kg</figcaption>`;
+}
+
+// ---------- Edit plan: this user's copy of the Autumn plan, saved on the profile row (gym.js planOf) ----------
+
+const PLAN_ORDER = ["A", "C", "D", "B"]; // Monday first
+const GRIP = `<svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h14M5 12h14M5 16h14"/></svg>`;
+const restText = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+const planItems = (key) => planOf(profile()).sessions[key].items.map((e) => ({ ...e }));
+/** Only what differs from the Autumn plan is stored, so a fix to the plan's own rules still reaches edited sessions. */
+const lean = (e) => { const d = exerciseById(e.id); return d ? Object.fromEntries(Object.entries(e).filter(([k, v]) => k === "id" || JSON.stringify(v) !== JSON.stringify(d[k]))) : e; };
+function savePlan(key, items) {
+  const p = profileRow(), plan = { ...(p.user_data.plan ?? {}) }, list = items.map(lean);
+  if (JSON.stringify(list) === JSON.stringify(PLAN.sessions[key].items.map((e) => ({ id: e.id })))) delete plan[key]; else plan[key] = list;
+  patch(p, { plan });
+  redraw();
+}
+function moveExercise(from, to, key = nav.at(-1).key) {
+  const items = planItems(key), [x] = items.splice(from, 1);
+  items.splice(to, 0, x);
+  savePlan(key, items);
+}
+function removeExercise(i, key = nav.at(-1).key) {
+  const before = planItems(key);
+  if (before.length < 2) { ctx.toast("A session needs one exercise."); return redraw(); }
+  savePlan(key, before.filter((_, j) => j !== i));
+  ctx.toast(`Removed ${before[i].name}`, () => savePlan(key, before));
+}
+
+function planScreen(key) {
+  return `${ctx.head("Edit plan", "Changes start with the next session.")}
+    ${seg("plan-key", PLAN_ORDER.indexOf(key), PLAN_ORDER.map((k) => DAYS[(PLAN.sessions[k].day + 6) % 7]), "Session")}
+    <div id="gym-plan-list">${planList(key)}</div>`;
+}
+function planList(key) {
+  const items = planOf(profile()).sessions[key].items, own = !!profile()?.plan?.[key];
+  return `<p class="caption-h">${esc(PLAN.sessions[key].name)}${own ? " · edited" : ""}</p>
+    <ul class="group flat gym-plan">${items.map((e, i) => `<li data-i="${i}"><div class="gym-del" aria-hidden="true">Remove</div>
+      <div class="slide"><button class="row" type="button" data-g="plan-ex" data-i="${i}"><span class="text"><span class="title">${esc(e.name)}</span>
+        <span class="subtitle">${e.sets} × ${reps(e)} · ${e.rest ? `rest ${restText(e.rest)}` : "no rest"}</span></span>${ctx.ICON.chev}</button>
+      <button class="gym-grip" type="button" data-i="${i}" aria-label="Move ${esc(e.name)}, ${i + 1} of ${items.length}. Up and down arrows move it.">${GRIP}</button></div></li>`).join("")}</ul>
+    <ul class="group flat mt-12">${ctx.row({ tag: "button", attrs: `data-g="plan-add"`, title: "Add exercise", titleCls: "gym-link" })}</ul>
+    <p class="foot mt-12">Swipe left to remove. Drag the lines to reorder.</p>
+    ${own ? `<div class="gym-actions"><button class="btn plain" type="button" data-g="plan-reset">Reset to the Autumn plan</button></div>` : ""}`;
+}
+
+// Gestures on the plan's rows: swiped left past 40% (or flicked past 20%), a row is removed with Undo; the grip drags it.
+function planGestures(root) {
+  let g = null;
+  root.addEventListener("pointerdown", (ev) => {
+    const li = ev.target.closest(".gym-plan > li");
+    if (!li || g || ev.button > 0) return;
+    const grip = ev.target.closest(".gym-grip");
+    g = { li, id: ev.pointerId, x: ev.clientX, y: ev.clientY, mode: "", hist: [] };
+    if (grip) { grip.setPointerCapture?.(ev.pointerId); dragStart(g); }
+  });
+  root.addEventListener("pointermove", (ev) => {
+    if (!g || ev.pointerId !== g.id) return;
+    const dx = ev.clientX - g.x, dy = ev.clientY - g.y;
+    if (g.mode === "drag") return dragMove(g, dy);
+    if (!g.mode) {
+      if ((Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) || dx > 10) { g = null; return; }
+      if (dx > -8) return;
+      g.mode = "swipe"; g.x -= 8; g.li.dataset.dir = "l";
+    }
+    g.hist.push([ev.timeStamp, ev.clientX]);
+    while (g.hist.length > 2 && ev.timeStamp - g.hist[0][0] > 100) g.hist.shift();
+    g.li.querySelector(".slide").style.transform = `translate3d(${Math.min(0, ev.clientX - g.x)}px,0,0)`;
+  });
+  const up = (ev) => {
+    if (!g || ev.pointerId !== g.id) return;
+    const { li, mode, hist: h } = g, x0 = g.x;
+    g = null;
+    if (!mode) return;
+    noClick = Date.now() + 350;
+    if (mode === "drag") return dragEnd(li._drag, ev.type === "pointercancel");
+    const el = li.querySelector(".slide"), w = li.offsetWidth, dx = Math.min(0, ev.clientX - x0);
+    const v = h.length > 1 ? (h.at(-1)[1] - h[0][1]) / Math.max(1, h.at(-1)[0] - h[0][0]) : 0;
+    const commit = ev.type !== "pointercancel" && (dx < -w * 0.4 || (v < -0.11 && dx < -w * 0.2));
+    const end = () => { if (commit) removeExercise(Number(li.dataset.i)); else { el.style.transform = ""; delete li.dataset.dir; } };
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return end();
+    el.animate([{ transform: `translate3d(${dx}px,0,0)` }, { transform: `translate3d(${commit ? -w : 0}px,0,0)` }], { duration: commit ? 200 : 240, easing: DRAWER }).onfinish = end;
+  };
+  root.addEventListener("pointerup", up);
+  root.addEventListener("pointercancel", up);
+  root.addEventListener("keydown", (ev) => { // the grip by keyboard: up and down arrows move the exercise one place
+    const grip = ev.target.closest?.(".gym-grip");
+    if (!grip || (ev.key !== "ArrowUp" && ev.key !== "ArrowDown")) return;
+    ev.preventDefault();
+    const i = Number(grip.dataset.i), to = i + (ev.key === "ArrowUp" ? -1 : 1);
+    if (to < 0 || to >= planItems(nav.at(-1).key).length) return;
+    moveExercise(i, to);
+    $("train").querySelector(`.gym-grip[data-i="${to}"]`)?.focus();
+  });
+}
+function dragStart(g) {
+  const lis = [...g.li.parentElement.children], from = lis.indexOf(g.li);
+  g.mode = "drag";
+  g.li._drag = { li: g.li, lis, from, to: from, h: g.li.offsetHeight, mids: lis.map((l) => { const r = l.getBoundingClientRect(); return r.top + r.height / 2; }) };
+  g.li.parentElement.classList.add("dragging"); g.li.classList.add("lifted");
+}
+function dragMove(g, dy) {
+  const d = g.li._drag, c = d.mids[d.from] + dy;
+  g.li.style.transform = `translate3d(0,${dy}px,0)`;
+  d.to = d.mids.filter((m, j) => j !== d.from && m < c).length;
+  d.lis.forEach((l, j) => {
+    if (j === d.from) return;
+    const s = j > d.from && j <= d.to ? -d.h : j < d.from && j >= d.to ? d.h : 0;
+    l.style.transform = s ? `translate3d(0,${s}px,0)` : "";
+  });
+}
+function dragEnd(d, cancel) {
+  d.li.parentElement?.classList.remove("dragging"); d.li.classList.remove("lifted");
+  for (const l of d.lis) l.style.transform = "";
+  if (!cancel && d.to !== d.from) moveExercise(d.from, d.to);
 }
 
 /** Account → Train: WHOOP and the setup live here, not on the Train page. */
@@ -341,15 +623,18 @@ const elapsed = () => `${Math.max(0, Math.floor((Date.now() - live.start) / 6000
 const active = () => live.items.filter((e) => !live.skipped.includes(e.id));
 
 function startSession(key) {
-  const today = todayString(), sessions = sessionsOf(rows), rx = prescribe(key, today, { sessions, profile: profile(), recovery: whoop.recovery });
+  const today = todayString(), sessions = sessionsOf(rows), rugby = dayPlan(today, dayRows(), profile()).rugby;
+  const rx = prescribe(key, today, { sessions, profile: profile(), recovery: whoop.recovery, rugby });
   live = { key, name: rx.name, start: Date.now(), feel: null, deload: rx.phase === "deload", rest: null, skipped: [], swaps: {},
     items: rx.items.map((e) => {
       const last = lastTime(e.id, sessions)?.sets ?? [];
-      return { id: e.id, name: e.name, kind: e.kind, unit: e.unit, lo: e.lo, hi: e.hi, rir: e.rir, rest: e.rest, note: e.note ?? "", up: e.up, alts: exerciseById(e.id)?.alts ?? [],
+      return { id: e.id, name: e.name, kind: e.kind, unit: e.unit, lo: e.lo, hi: e.hi, rir: e.rir, rest: e.rest, note: e.note ?? "", up: e.up, alts: e.alts ?? [],
         sets: Array.from({ length: e.sets }, (_, i) => ({ load: e.load, reps: e.kind === "time" ? e.hi : (last[i]?.reps ?? e.hi), rir: null, done: false })) };
     }) };
   token().then((t) => { jwt = t ?? jwt; }).catch(() => {});
   saveLive();
+  nav = [];
+  awake();
   ctx.closeSheet($("train-sheet"));
   ctx.rerender();
   scrollTo(0, 0);
@@ -363,6 +648,20 @@ function progress() {
   for (const e of active()) { const i = e.sets.findIndex((s) => !s.done); if (i >= 0) return { e, i, done, all: sets.length }; }
   return { e: null, i: -1, done, all: sets.length };
 }
+
+/** The Screen Wake Lock while a session runs, so the phone doesn't lock between sets. Where it's refused (Low Power Mode,
+ *  an older iOS) the screen sleeps as before. */
+function awake() {
+  if (!live || wake || document.visibilityState !== "visible" || !navigator.wakeLock) return;
+  // Each request owns `wake` only while it is the current one, so a late release or refusal never clears a newer lock.
+  const p = navigator.wakeLock.request("screen").then((l) => {
+    l.addEventListener("release", () => { if (wake === p) wake = null; });
+    if (!live || wake !== p) l.release();
+    return l;
+  }, () => { if (wake === p) wake = null; return null; });
+  wake = p;
+}
+function sleep() { const w = wake; wake = null; w?.then((l) => l?.release()).catch(() => {}); }
 
 /** The live hero: the exercise now, its set and value; the rest countdown in the figure while resting. */
 function liveHero() {
@@ -383,29 +682,55 @@ function paintLive() {
 function liveScreen() {
   let out = `${ctx.head(live.name, live.deload ? "Deload" : "")}${liveHero()}
     <p class="caption-h mt-20">How do you feel?</p>${seg("feel", live.feel == null ? null : live.feel - 1, FEEL, "How do you feel")}`;
+  const sessions = sessionsOf(rows);
   live.items.forEach((e, ei) => {
-    const skipped = live.skipped.includes(e.id), name = live.swaps[e.id] ?? e.name;
-    out += `<div class="gym-ex-head"><h2 class="section">${esc(name)}</h2>
+    const skipped = live.skipped.includes(e.id), swapped = !!live.swaps[e.id], name = live.swaps[e.id] ?? e.name;
+    const plain = !swapped && e.kind !== "time", last = plain ? lastTime(e.id, sessions) : null;
+    let b = plain ? bestOf(e.id, sessions) : null;
+    if (!b?.n) b = null; // no history yet: this session is the baseline, so nothing in it is a PR
+    out += `<div class="gym-ex-head"><h2 class="section">${swapped ? esc(name) : `<button class="gym-ex-link" type="button" data-g="open-ex" data-id="${esc(e.id)}">${esc(name)}${ctx.ICON.chev}</button>`}</h2>
       <button class="gym-more" type="button" data-g="menu" data-e="${ei}" aria-label="More for ${esc(name)}">${ctx.ICON.more}</button></div>
       <p class="foot">${skipped ? "Skipped" : `${e.sets.length} × ${reps(e)}${e.kind === "load" ? ` · RIR ${e.rir}` : ""}${e.up ? " · weight up" : ""}${!live.swaps[e.id] && e.note ? ` · ${esc(e.note)}` : ""}`}</p>`;
     if (skipped) return;
-    out += `<ul class="group gym-sets mt-12">${e.sets.map((s, si) => `<li class="task${s.done ? " done" : ""}${just === `set${ei}-${si}` ? " just" : ""}">
-      <button class="tick" type="button" data-g="set" data-e="${ei}" data-s="${si}" aria-pressed="${s.done}" aria-label="Set ${si + 1}, ${esc(setValue(e, s))}: ${s.done ? "done" : "not done"}">${TICK}</button>
+    // Each set: the tick (the big target), "Last 115 × 5" under its number (tap to use it), and the value (tap to change it).
+    out += `<ul class="group gym-sets mt-12">${e.sets.map((s, si) => {
+      const pr = b && s.done && beats(b, s), l = last && (last.sets[si] ?? last.sets.at(-1));
+      if (b && s.done) absorb(b, s);
+      const lastLine = l ? `<button class="gym-last" type="button" data-g="fill" data-e="${ei}" data-s="${si}" aria-label="Use last time's ${esc(setText(e.kind, l))}">Last ${e.kind === "load" ? `${num(l.load ?? 0)} × ${l.reps}` : `${l.reps} reps`}</button>` : "";
+      return `<li class="task${s.done ? " done" : ""}${just === `set${ei}-${si}` ? " just" : ""}">
+      <button class="tick" type="button" data-g="set" data-e="${ei}" data-s="${si}" aria-pressed="${s.done}" aria-label="Set ${si + 1}, ${esc(setValue(e, s))}: ${s.done ? "done" : "not done"}${pr ? ", a record" : ""}">${TICK}</button>
       ${e.kind === "time" ? `<div class="row"><span class="text"><span class="title">Set ${si + 1}</span></span><span class="trail">${esc(setValue(e, s))}</span></div>`
-        : `<button class="row" type="button" data-g="edit-set" data-e="${ei}" data-s="${si}"><span class="text"><span class="title">Set ${si + 1}</span>${s.rir != null ? `<span class="subtitle">RIR ${s.rir}</span>` : ""}</span>
-          <span class="trail">${esc(setValue(e, s))}</span>${ctx.ICON.chev}</button>`}</li>`).join("")}</ul>`;
+        : `<div class="row"><span class="text"><span class="title">Set ${si + 1}${pr ? PR : ""}</span>${lastLine || s.rir != null ? `<span class="subtitle gym-sub">${lastLine}${lastLine && s.rir != null ? " · " : ""}${s.rir != null ? `RIR ${s.rir}` : ""}</span>` : ""}</span>
+          <button class="gym-val" type="button" data-g="edit-set" data-e="${ei}" data-s="${si}" aria-label="Change set ${si + 1}"><span class="trail">${esc(setValue(e, s))}</span>${ctx.ICON.chev}</button></div>`}</li>`;
+    }).join("")}</ul>`;
   });
   out += `<div class="gym-actions"><button class="btn primary" type="button" data-g="finish">Finish</button>
-    <button class="btn plain gym-danger" type="button" data-g="discard">Discard session</button></div>
-    <div class="gym-rest chrome" ${live.rest ? "" : "hidden"} role="timer" aria-live="off"><span>Rest</span><b id="gym-rest-left">${restLeft()}</b>
-      <button class="btn small secondary" type="button" data-g="skip-rest">Skip</button></div>`;
+    <button class="btn plain gym-danger" type="button" data-g="discard">Discard session</button></div>${restPill()}`;
   return out;
 }
+
+/** The rest pill, on the session and on any screen pushed over it, so a rest keeps counting while you look something up. */
+const restPill = () => `<div class="gym-rest chrome" ${live?.rest ? "" : "hidden"} role="timer" aria-live="off"><span>Rest</span><b id="gym-rest-left">${restLeft()}</b>
+  <button class="gym-adj" type="button" data-g="rest-adj" data-v="-15" aria-label="15 seconds less">−15</button>
+  <button class="gym-adj" type="button" data-g="rest-adj" data-v="15" aria-label="15 seconds more">+15</button>
+  <button class="btn small secondary" type="button" data-g="skip-rest">Skip</button></div>`;
 
 function restLeft() {
   const s = live?.rest ? Math.max(0, Math.ceil((live.rest.until - Date.now()) / 1000)) : 0;
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
+/** −15 s / +15 s on the rest pill; the lock-screen push moves with it. */
+function restAdjust(v) {
+  const r = live?.rest;
+  if (!r) return;
+  r.until = Math.max(Date.now() + 1000, r.until + v * 1000);
+  clearTimeout(quietTimer);
+  quietTimer = setTimeout(restQuiet, Math.max(0, r.until - Date.now() - 10_000));
+  if (r.server) restWrite(r.until, r.body);
+  saveLive();
+  for (const id of ["gym-rest-left", "gym-rest-fig"]) { const el = $(id); if (el) el.textContent = restLeft(); }
+}
+
 function tick() {
   clearInterval(restTimer);
   restTimer = setInterval(() => {
@@ -441,10 +766,11 @@ function finish(wrecked) {
   const sets = live.items.flatMap((e) => live.skipped.includes(e.id) ? [] : e.sets.map((s) => ({ ex: e.id, load: s.load, reps: s.reps, rir: s.rir, done: s.done,
     ...(live.swaps[e.id] ? { swap: live.swaps[e.id] } : {}) })));
   add({ id: `you-gym-${crypto.randomUUID()}`, date: today, title: live.name,
-    data: { type: "session", key: live.key, start: live.start, end, feel: live.feel, wrecked, deload: live.deload, sets, skipped: live.skipped, swaps: live.swaps },
+    data: { type: "session", key: live.key, start: live.start, end, feel: live.feel, wrecked, deload: live.deload, sets, skipped: live.skipped, swaps: live.swaps,
+      names: Object.fromEntries(live.items.map((e) => [e.id, e.name])) },
     user_data: {} });
   restStop();
-  live = null; saveLive();
+  live = null; saveLive(); sleep();
   status = "Saved. WHOOP strain comes back once the band has scored the workout.";
   ctx.closeSheet($("train-sheet"));
   ctx.rerender();
@@ -456,10 +782,10 @@ function finish(wrecked) {
 function discard() {
   const kept = live;
   restStop();
-  live = null; saveLive();
+  live = null; saveLive(); sleep();
   ctx.rerender();
   scrollTo(0, 0);
-  ctx.toast("Session discarded", () => { live = { ...kept, rest: null }; saveLive(); ctx.rerender(); });
+  ctx.toast("Session discarded", () => { live = { ...kept, rest: null }; saveLive(); awake(); ctx.rerender(); });
 }
 
 // ---------- The sheet (one dialog, one mode at a time; the shell opens, drags and closes it) ----------
@@ -483,14 +809,15 @@ function paintSheet() {
   let html = "";
   const e = live?.items[sheet.ei];
   if (sheet.mode === "set") {
-    const s = e.sets[sheet.si];
-    html = `${sheetHead(live.swaps[e.id] ?? e.name, `Set ${sheet.si + 1} of ${e.sets.length}`)}
-      <ul class="group">${e.kind === "load" ? `<li><div class="row"><span class="text"><span class="title">Weight</span><span class="subtitle">kg</span></span>
+    const { s, kind, name, sub } = cur();
+    html = `${sheetHead(name, sub)}
+      <ul class="group">${kind === "load" ? `<li><div class="row"><span class="text"><span class="title">Weight</span><span class="subtitle">kg</span></span>
           <input class="gym-input" type="text" inputmode="decimal" data-g="set-load" value="${s.load ?? ""}" aria-label="Weight in kg">${stepper("step", null, "Weight", `data-f="load"`).replace("<b>–</b>", "")}</div></li>` : ""}
         <li><div class="row"><span class="text"><span class="title">Reps</span></span>
           <input class="gym-input short" type="text" inputmode="numeric" data-g="set-reps" value="${s.reps ?? ""}" aria-label="Reps">${stepper("step", null, "Reps", `data-f="reps"`).replace("<b>–</b>", "")}</div></li></ul>
-      ${e.kind === "load" ? `<p class="caption-h">Reps in reserve</p>${seg("set-rir", s.rir, ["0", "1", "2", "3", "4"], "Reps in reserve")}` : ""}
-      <button class="btn primary" type="button" data-close>Done</button>`;
+      ${kind === "load" ? `<p class="caption-h">Reps in reserve</p>${seg("set-rir", s.rir, ["0", "1", "2", "3", "4"], "Reps in reserve")}` : ""}
+      <button class="btn primary" type="button" data-close>Done</button>
+      ${sheet.row ? `<button class="btn plain gym-danger" type="button" data-g="uncount">Doesn’t count</button>` : ""}`;
   }
   if (sheet.mode === "menu") {
     const skipped = live.skipped.includes(e.id);
@@ -500,13 +827,14 @@ function paintSheet() {
       ${ctx.row({ tag: "button", attrs: `data-g="${skipped ? "unskip" : "skip"}" data-e="${sheet.ei}"`, title: skipped ? "Bring back" : "Skip exercise" })}</ul>`;
   }
   if (sheet.mode === "swap") {
-    html = `${sheetHead(`Swap ${e.name}`)}${e.alts.length ? `<ul class="group">${e.alts.map((a) => ctx.row({ tag: "button", attrs: `data-g="swap-to" data-name="${esc(a)}"`,
+    html = `${sheetHead(`Swap ${e.name}`)}${seg("swap-mode", sheet.update ? 1 : 0, ["Just today", "Update plan"], "Swap for")}
+      <p class="foot" id="gym-swap-why">${swapWhy(e)}</p>${e.alts.length ? `<ul class="group">${e.alts.map((a) => ctx.row({ tag: "button", attrs: `data-g="swap-to" data-name="${esc(a)}"`,
         title: esc(a), trail: live.swaps[e.id] === a ? check : "" })).join("")}</ul>` : ""}
       <ul class="group flat"><li><input class="gym-text" type="text" data-g="swap-other" value="${esc(sheet.other ?? "")}" placeholder="Something else" aria-label="Something else" autocapitalize="sentences"></li></ul>
       <button class="btn secondary" type="button" data-g="swap-to-other" ${(sheet.other ?? "").trim() ? "" : "disabled"}>Swap</button>`;
   }
   if (sheet.mode === "others") {
-    const key = sessionForDay(todayString());
+    const key = dayPlan(todayString(), dayRows(), profile()).key;
     html = `${sheetHead("Another session")}<ul class="group">${KEYS.filter((k) => k !== key).map((k) => ctx.row({ tag: "button", attrs: `data-g="start" data-key="${k}"`,
       title: esc(PLAN.sessions[k].name), sub: `${PLAN.sessions[k].items.length} exercises`, chev: true })).join("")}</ul>`;
   }
@@ -527,44 +855,55 @@ function paintSheet() {
       <p class="foot">${esc(line)}${nudge ? ` ${esc(nudge)}` : ""}</p>
       <button class="btn primary" type="button" data-g="save-weight">Save</button>`;
   }
-  if (sheet.mode === "food") html = foodSheet();
+  if (sheet.mode === "plan-ex") {
+    const x = sheet.items[sheet.i], time = x.kind === "time", f = (label, field, value) => `<li><div class="row"><span class="text"><span class="title">${label}</span></span>
+      ${stepper("pstep", value, label, `data-f="${field}"`)}</div></li>`;
+    html = `${sheetHead(x.name, PLAN.sessions[sheet.key].name)}<ul class="group">${f("Sets", "sets", x.sets)}
+      ${time ? f(x.unit === "min" ? "Minutes" : "Seconds", "hi", x.hi) : `${f("Reps from", "lo", x.lo)}${f("Reps to", "hi", x.hi)}`}
+      ${f("Rest", "rest", x.rest ? restText(x.rest) : "Off")}</ul>
+      <ul class="group flat"><li><input class="gym-text" type="text" data-g="plan-note" value="${esc(x.note ?? "")}" placeholder="Add a note" aria-label="Note" autocapitalize="sentences" maxlength="80"></li></ul>
+      <button class="btn primary" type="button" data-close>Done</button>
+      <button class="btn plain gym-danger" type="button" data-g="plan-remove">Remove from plan</button>`;
+  }
+  if (sheet.mode === "plan-add") {
+    const plan = planOf(profile()), have = new Set(plan.sessions[sheet.key].items.map((x) => x.id)), seen = new Set();
+    const picks = KEYS.flatMap((k) => [...plan.sessions[k].items, ...PLAN.sessions[k].items]).filter((x) => !have.has(x.id) && !seen.has(x.id) && seen.add(x.id));
+    html = `${sheetHead("Add exercise", PLAN.sessions[sheet.key].name)}
+      <ul class="group flat"><li><input class="gym-text" type="text" data-g="add-name" value="${esc(sheet.name)}" placeholder="Name, e.g. Lat pulldown" aria-label="Exercise name" autocapitalize="sentences" maxlength="60"></li></ul>
+      ${seg("add-kind", sheet.kind, ["Weight × reps", "Reps only"], "Logged as")}
+      <button class="btn secondary" type="button" data-g="add-new" ${sheet.name.trim() ? "" : "disabled"}>Add</button>
+      ${picks.length ? `<p class="caption-h">From the plan</p><ul class="group">${picks.map((x) => ctx.row({ tag: "button", attrs: `data-g="add-pick" data-id="${esc(x.id)}"`,
+        title: esc(x.name), sub: `${x.sets} × ${reps(x)}` })).join("")}</ul>` : ""}`;
+  }
   dlg.innerHTML = html;
 }
 
-// ---------- Food (research doc §8) ----------
-
-function foodSheet() {
-  const today = todayString(), meals = of("meal").filter((m) => m.date === today), totals = dayFood(of("meal"), today);
-  const est = food.items.reduce((t, i) => ({ p: t.p + i.protein_g, k: t.k + i.kcal }), { p: 0, k: 0 });
-  const ready = food.photo || food.note.trim();
-  return `${sheetHead("Food", `About ${totals.protein} g protein of ${PROTEIN_TARGET(profile()?.weight)} g today`)}
-    ${meals.length ? `<ul class="group">${meals.map((m) => ctx.row({ title: esc(m.data.note || m.data.items.map((i) => i.name).join(", ")),
-      trail: `${m.data.items.reduce((a, i) => a + i.protein_g, 0)} g` })).join("")}</ul>` : ""}
-    <ul class="group flat">
-      <li><label class="row">${ctx.ICON.camera}<span class="text"><span class="title">${food.photo ? "Photo added" : "Take a photo"}</span></span>
-        <input class="overlay" type="file" accept="image/*" capture="environment" data-g="photo" aria-label="Take a photo"></label></li>
-      <li><input class="gym-text" type="text" data-g="note" value="${esc(food.note)}" placeholder="What it is, e.g. half chicken and rice" aria-label="What it is" autocapitalize="sentences"></li></ul>
-    ${food.error ? `<p class="foot warn">${esc(food.error)}</p>` : ""}
-    ${food.items.length ? `<ul class="group flat">${food.items.map((i, n) => `<li><label class="row"><span class="text"><span class="title">${esc(i.name)}</span>
-      <span class="subtitle">${i.protein_g} g protein · ${i.kcal} kcal</span></span>
-      <span class="gym-field"><input class="gym-input" type="text" inputmode="numeric" data-g="grams" data-i="${n}" value="${i.grams}" aria-label="${esc(i.name)} grams"><span class="gym-unit">g</span></span></label></li>`).join("")}</ul>
-      <p class="foot">About ${est.p} g protein, ${est.k} kcal. Photo estimates read low on big portions, so fix the grams of the main item.</p>
-      <button class="btn primary" type="button" data-g="save-meal">Save</button>
-      <button class="btn plain" type="button" data-g="estimate" ${food.busy ? "disabled" : ""}>${food.busy ? "Estimating…" : "Re-estimate"}</button>`
-    : `<button class="btn primary" type="button" data-g="estimate" ${food.busy || !ready ? "disabled" : ""}>${food.busy ? "Estimating…" : "Estimate"}</button>`}`;
+/** The set the sheet edits: one in the session now, or a past one (a copy, saved when the sheet closes). */
+function cur() {
+  if (sheet.row) {
+    const s = sheet.sets[sheet.i], r = rowById(sheet.row), n = sheet.sets.slice(0, sheet.i + 1).filter((x) => x.ex === s.ex && x.done && x.swap === s.swap).length;
+    return { s, kind: exOf(s.ex)?.kind ?? "load", name: s.swap ?? exName(s.ex, r), sub: `Set ${n} · ${dayName(r.date, { weekday: "short", day: "numeric", month: "short" })}` };
+  }
+  const e = live.items[sheet.ei];
+  return { s: e.sets[sheet.si], kind: e.kind, name: live.swaps[e.id] ?? e.name, sub: `Set ${sheet.si + 1} of ${e.sets.length}` };
 }
+const swapWhy = (e) => (sheet.update ? `From now on. The new lift keeps its own history; ${e.name}’s weights stay as they are.`
+  : `Today only. It’s logged under its own name and never moves ${e.name}’s weights.`);
 
-async function estimate() {
-  food.busy = true; food.error = ""; paintSheet();
-  try {
-    const reply = ctx.demo ? demoFood() : await call("ai", foodRequest(food.note, food.photo), { "X-Sidebrain-Task": "food" });
-    food.items = parseFood(reply).map((i) => scaleItem(i, i.grams));
-    if (!food.items.length) food.error = "Couldn’t read that meal. Add a line about what it is and try again.";
-  } catch (e) { food.error = e.message; }
-  food.busy = false; paintSheet();
+/** "Update plan" on a swap: the plan takes the new lift for good. Today moves to it only when nothing of it is ticked yet
+ *  (gym.js updateSwap); otherwise today stays a swap, so ticked sets never count for the new lift. */
+function planSwap(ei, name) {
+  const id = idFor(name);
+  if (live.items.some((x, j) => j !== ei && x.id === id) || planItems(live.key).some((x) => x.id === id && x.id !== live.items[ei].id)) {
+    ctx.toast(`${name} is already in this session.`);
+    return;
+  }
+  const r = updateSwap(live, ei, name, planItems(live.key), sessionsOf(rows));
+  live = r.live;
+  saveLive();
+  savePlan(live.key, r.items);
+  if (r.today === "swap") ctx.toast("Plan updated from next session. Today stays a swap.");
 }
-const demoFood = () => ({ output: [{ content: [{ type: "output_text", text: JSON.stringify({ items: [
-  { name: "Grilled chicken", grams: 250, protein_g: 62, kcal: 410 }, { name: "Spicy rice", grams: 220, protein_g: 6, kcal: 330 }] }) }] }] });
 
 // ---------- Events ----------
 
@@ -579,15 +918,69 @@ function setLoad(ei, si, v) { // a load carries to the later sets not yet ticked
 
 function click(ev) {
   const t = ev.target.closest("[data-g]");
-  if (!t || t.tagName === "INPUT" || t.tagName === "SELECT") return;
+  if (!t || t.tagName === "INPUT" || t.tagName === "SELECT" || Date.now() < noClick) return;
   const d = t.dataset, ei = Number(d.e ?? sheet?.ei), si = Number(d.s ?? sheet?.si);
   switch (d.g) {
     // Plan
     case "start": return startSession(d.key);
+    // History, an exercise, Edit plan
+    case "history": return go({ s: "history" });
+    case "open-session": return go({ s: "session", id: d.id });
+    case "open-ex": return go({ s: "exercise", id: d.id });
+    case "plan": return go({ s: "plan", key: sessionForDay(todayString()) ?? "A" });
+    case "past-set": return openSheet("set", { row: d.id, i: Number(d.i), sets: structuredClone(setsOf(rowById(d.id))) });
+    case "uncount": sheet.sets[sheet.i].done = false; sheet.dirty = true; return closeSheet();
+    case "del-session": {
+      const r = rowById(d.id);
+      patch(r, { deleted: true });
+      back();
+      return ctx.toast("Session deleted", () => { patch(r, { deleted: false }); ctx.rerender(); });
+    }
+    case "chart-m": case "chart-r": {
+      if (d.g === "chart-m") chartM = Number(d.v); else chartR = Number(d.v);
+      pickSeg(t);
+      const sc = nav.at(-1), el = $("gym-chart");
+      if (el) el.innerHTML = chart(exerciseLog(sc.id, sessionsOf(rows)));
+      return;
+    }
+    case "plan-key": {
+      nav.at(-1).key = PLAN_ORDER[Number(d.v)];
+      pickSeg(t);
+      $("gym-plan-list").innerHTML = planList(nav.at(-1).key);
+      return;
+    }
+    case "plan-ex": return openSheet("plan-ex", { key: nav.at(-1).key, i: Number(d.i), items: planItems(nav.at(-1).key) });
+    case "pstep": {
+      const x = sheet.items[sheet.i], v = Number(d.v), f = d.f;
+      if (f === "sets") x.sets = Math.min(10, Math.max(1, x.sets + v));
+      if (f === "lo") x.lo = Math.min(x.hi, Math.max(1, x.lo + v));
+      if (f === "hi") { x.hi = Math.min(60, Math.max(x.kind === "time" ? 1 : x.lo, x.hi + v)); if (x.kind === "time") x.lo = x.hi; }
+      if (f === "rest") x.rest = Math.min(600, Math.max(0, x.rest + v * 15));
+      sheet.dirty = true;
+      t.parentElement.querySelector("b").textContent = f === "rest" ? (x.rest ? restText(x.rest) : "Off") : x[f];
+      return;
+    }
+    case "plan-remove": { const { key, i } = sheet; sheet.dirty = false; closeSheet(); return removeExercise(i, key); }
+    case "plan-add": return openSheet("plan-add", { key: nav.at(-1).key, name: "", kind: 0 });
+    case "add-kind": sheet.kind = Number(d.v); return pickSeg(t);
+    case "add-new": case "add-pick": {
+      const key = sheet.key, items = planItems(key), name = (sheet.name ?? "").trim().slice(0, 60);
+      const id = d.g === "add-pick" ? d.id : idFor(name);
+      if (items.some((x) => x.id === id)) return ctx.toast("That’s already in this session.");
+      const base = exOf(id);
+      items.push(base ? { ...base } : { id, name, kind: sheet.kind === 1 ? "reps" : "load", sets: 3, lo: 8, hi: 12, rest: 90, note: "" });
+      closeSheet();
+      return savePlan(key, items);
+    }
+    case "plan-reset": return ctx.ask("Reset this session to the Autumn plan? Your changes to it go.", "Reset", () => {
+      const p = profileRow(), plan = { ...(p.user_data.plan ?? {}) };
+      delete plan[nav.at(-1).key];
+      patch(p, { plan }); redraw();
+    });
     case "others": return openSheet("others");
     case "deload": patch(profileRow(), { deloadFrom: todayString() }); status = "Deload week: half the sets, same loads, until next week."; return ctx.rerender();
     case "weight": return openSheet("weight");
-    case "food": food = { items: [], note: "", busy: false, error: "", photo: null }; return openSheet("food");
+    case "food": return ctx.food.open();
     // Account → Train
     case "whoop": return connectWhoop();
     case "edit": ctx.closeSheet($("sheet")); ctx.tab(); editing = true; startSetup(); ctx.rerender(); return scrollTo(0, 0);
@@ -604,20 +997,34 @@ function click(ev) {
     case "feel": live.feel = Number(d.v) + 1; saveLive(); return pickSeg(t);
     case "set": return toggleSet(ei, si);
     case "edit-set": return openSheet("set", { ei, si });
-    case "step": {
-      const s = live.items[ei].sets[si], dir = Number(d.v);
-      if (d.f === "load") setLoad(ei, si, Math.max(0, round((s.load ?? 0) + dir * 2.5, 0.5)));
-      else s.reps = Math.max(0, (s.reps ?? 0) + dir);
+    case "fill": {
+      const e = live.items[ei], l = lastTime(e.id, sessionsOf(rows))?.sets, x = l && (l[si] ?? l.at(-1));
+      if (!x) return;
+      if (e.kind === "load") setLoad(ei, si, x.load ?? null);
+      e.sets[si].reps = x.reps;
       saveLive();
+      return ctx.rerender();
+    }
+    case "rest-adj": return restAdjust(Number(d.v));
+    case "step": {
+      const { s } = cur(), dir = Number(d.v);
+      if (d.f === "load") { const v = Math.max(0, round((s.load ?? 0) + dir * 2.5, 0.5)); if (sheet.row) s.load = v; else setLoad(ei, si, v); }
+      else s.reps = Math.max(0, (s.reps ?? 0) + dir);
+      sheet.dirty = true;
+      if (!sheet.row) saveLive();
       const box = $("train-sheet").querySelector(`[data-g="set-${d.f}"]`);
       if (box) box.value = d.f === "load" ? s.load ?? "" : s.reps ?? "";
       return ctx.rerender();
     }
-    case "set-rir": live.items[ei].sets[si].rir = Number(d.v); saveLive(); pickSeg(t); return ctx.rerender();
+    case "set-rir": cur().s.rir = Number(d.v); sheet.dirty = true; if (!sheet.row) saveLive(); pickSeg(t); return ctx.rerender();
     case "menu": return openSheet("menu", { ei });
-    case "swap": return openSheet("swap", { ei, other: "" });
-    case "swap-to": live.swaps[live.items[ei].id] = d.name; saveLive(); closeSheet(); return ctx.rerender();
-    case "swap-to-other": live.swaps[live.items[ei].id] = (sheet.other ?? "").trim().slice(0, 60); saveLive(); closeSheet(); return ctx.rerender();
+    case "swap": return openSheet("swap", { ei, other: "", update: false });
+    case "swap-mode": sheet.update = d.v === "1"; pickSeg(t); $("gym-swap-why").textContent = swapWhy(live.items[ei]); return;
+    case "swap-to": case "swap-to-other": {
+      const name = d.g === "swap-to" ? d.name : (sheet.other ?? "").trim().slice(0, 60);
+      if (sheet.update) planSwap(ei, name); else { live.swaps[live.items[ei].id] = name; saveLive(); }
+      closeSheet(); return ctx.rerender();
+    }
     case "unswap": delete live.swaps[live.items[ei].id]; saveLive(); closeSheet(); return ctx.rerender();
     case "skip": live.skipped.push(live.items[ei].id); saveLive(); closeSheet(); return ctx.rerender();
     case "unskip": live.skipped = live.skipped.filter((id) => id !== live.items[ei].id); saveLive(); closeSheet(); return ctx.rerender();
@@ -633,10 +1040,6 @@ function click(ev) {
       if (r) patch(r, { kg: v }); else add({ id: `you-gym-w-${today}`, date: today, title: "Bodyweight", data: { type: "weight" }, user_data: { kg: v, userAt: Date.now() } });
       closeSheet(); return ctx.rerender();
     }
-    case "estimate": return estimate();
-    case "save-meal":
-      add({ id: `you-gym-${crypto.randomUUID()}`, date: todayString(), title: food.note.trim() || "Meal", data: { type: "meal", note: food.note.trim(), items: food.items }, user_data: {} });
-      closeSheet(); return ctx.rerender();
   }
 }
 
@@ -648,21 +1051,19 @@ function input(ev) {
   else if ((d.g === "lift-kg" || d.g === "lift-reps") && draft) (draft.lifts[d.id] ??= {})[d.g === "lift-kg" ? "kg" : "reps"] = t.value;
   else if (d.g === "swap-other" && sheet) { sheet.other = t.value; const b = $("train-sheet").querySelector('[data-g="swap-to-other"]'); if (b) b.disabled = !t.value.trim(); }
   else if (d.g === "weight" && sheet) sheet.value = t.value;
-  else if (d.g === "note") { food.note = t.value; const b = $("train-sheet").querySelector('[data-g="estimate"]'); if (b && !food.items.length) b.disabled = food.busy || !(food.photo || t.value.trim()); }
+  else if (d.g === "plan-note" && sheet) { sheet.items[sheet.i].note = t.value.slice(0, 80); sheet.dirty = true; }
+  else if (d.g === "add-name" && sheet) { sheet.name = t.value; const b = $("train-sheet").querySelector('[data-g="add-new"]'); if (b) b.disabled = !t.value.trim(); }
 }
 
-async function change(ev) {
+function change(ev) {
   const t = ev.target, d = t.dataset;
   if (d.g === "set-load" || d.g === "set-reps") {
-    const v = t.value === "" ? null : parse(t.value);
-    if (d.g === "set-load") setLoad(sheet.ei, sheet.si, v == null ? null : Math.max(0, v));
-    else live.items[sheet.ei].sets[sheet.si].reps = v == null ? null : Math.max(0, Math.round(v));
-    saveLive(); return ctx.rerender();
-  }
-  if (d.g === "grams") { const i = Number(d.i); food.items[i] = scaleItem(food.items[i], t.value); return paintSheet(); }
-  if (d.g === "photo" && t.files?.[0]) {
-    try { food.photo = await ctx.dataUrl(await ctx.shrink(t.files[0], 768)); } catch { food.error = "Couldn’t read that photo."; }
-    paintSheet();
+    const v = t.value === "" ? null : parse(t.value), { s } = cur();
+    if (d.g === "set-load") { const x = v == null ? null : Math.max(0, v); if (sheet.row) s.load = x; else setLoad(sheet.ei, sheet.si, x); }
+    else s.reps = v == null ? null : Math.max(0, Math.round(v));
+    sheet.dirty = true;
+    if (!sheet.row) saveLive();
+    return ctx.rerender();
   }
 }
 

@@ -6,8 +6,11 @@
 import { schedule, intervalLabel, due, nextDue, examDays, todayString, daysBetween, addDays } from "./sm2.js";
 import { withoutGreeting, dueSoon, runway, gone, parseWhen, daySchedule, ago, priorityDueLabel, shortDay, WEEKDAYS, MONTHS, effectiveDate,
          upNext, inbox, fireAt, snoozeChoices, nextBrief, briefLabel, clock, classNow, heroEvent, heroFigure, weekEnd, prep } from "./today.js";
-import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay, TICK } from "./notes.js";
+import { esc, markdown, lectureDoc, lectureNotes, ordered, lectureDay, modulesByName, TICK } from "./notes.js";
 import * as train from "./train.js";
+import { messageView, conversations, threadBody, mailUrl, foldedPings, plainHtml, replyLink, draftRequest, askRequest, answerText, docText } from "./nexi.js";
+import * as food from "./food.js";
+import { suggestions, showCheckin, dailyId, dailyOf, rugbyOn, RUGBY_LINE, muteUntil } from "./nudges.js";
 
 // ---- Settings to fill in before publishing (web/(C) README.md) ----
 const SUPABASE_URL = "https://rdwavprncthvujmckige.supabase.co";
@@ -16,7 +19,7 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const GOOGLE_CLIENT_ID = "327768131024-jqlmp8jeb6qtouq2b4sv8v1pigss6fa4.apps.googleusercontent.com";  // the Google *Web* OAuth client ID (README step 1)
 // Optional override. Empty: the app asks the push function for it (GET /functions/v1/push → {publicKey}).
 const VAPID_PUBLIC_KEY = "";
-const SUPABASE_JS = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/+esm";
+const SUPABASE_JS = "./vendor/supabase/supabase-js.js"; // 2.117.2, self-hosted (vendor/supabase/LICENSE) so the CSP allows no CDN
 // ponytail: supabase-js from a pinned CDN URL, no integrity check; vendor the file into web/ if that ever matters.
 
 const DEMO_MODE = new URLSearchParams(location.search).get("demo");
@@ -36,7 +39,7 @@ const load = (k, fallback) => { try { return JSON.parse(localStorage.getItem(PRE
 const keep = (k, v) => { try { localStorage.setItem(PREFIX + k, JSON.stringify(v)); } catch { /* private mode: the app still works, just without the offline copy */ } };
 
 let sb = null, user = null;
-let cards = [], byId = new Map(), assessments = [], tasks = [], applications = [], events = [], brief = null, notes = [], pings = [];
+let cards = [], byId = new Map(), assessments = [], tasks = [], applications = [], events = [], brief = null, notes = [], pings = [], messages = [];
 let modules = [], lectures = [], practice = [], noteById = new Map(); // Study: lecture notes are `note` items, by id
 let thumbs = new Map();              // photo path → signed URL (or a data URL in demo), for capture thumbnails
 let outbox = load("outbox", []);     // [{t: "review" | "tick" | "edit" | "attempt", id, user_data, activity?} | {t: "note" | "add", row}], oldest first
@@ -44,11 +47,16 @@ let captures = load("captures", []); // the last captures made on this phone: {i
 let synced = load("synced", 0), tried = 0;
 // The Train plugin (train.js): off until switched on in the Account sheet, per phone. Off, no `gym` row is fetched.
 let trainOn = load("train", false);
+let daily = load("daily", []);         // the check-in and Suggestions state: one synced gym row a day (nudges.js)
+// Nothing writes today's row until the server's copy (or this phone's saved one) is in: a row made before the fetch would
+// be refused as a duplicate, and the next write would then send this phone's thin copy as the whole user_data.
+let dailyReady = DEMO || load("daily", null) !== null;
+let sugOn = load("suggestions", true), sugRows = [], sugKey = null, checkinStep = 1;
 let tab = "today", reviewing = false, loaded = false, cloud = "", syncError = "", signedOutOfSync = false, reminders = "off";
 const photos = { add: null }; // the photo waiting in the composer
 // Today's view state.
 const held = new Map();     // task id → {kind: "done" | "gone", at, timer}: shown (ticked or leaving) until it collapses
-let sheetTask = null, sheetPing = null;
+let sheetTask = null;
 let addMode = "todo", todoIgnore = new Set(), todoParse = null, todoManual = null;
 const session = { queue: [], index: 0, flipped: false, grades: [0, 0, 0, 0], day: "", module: null, lecture: null };
 // Study screens, pushed and popped inside the tab like the Mac's StudyView: {s: "home" | "module" | "lecture" | "note" |
@@ -71,7 +79,9 @@ async function start() {
   train.mount({ sb: () => sb, user: () => user, esc, row, head, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY,
                 demo: DEMO, keep, load, rerender: () => render(), tab: () => switchTab("train"),
                 // Train builds on the shell's components (Design system.md): its sheet, the Undo toast, the confirm and folds.
-                openSheet, closeSheet, sheetGestures, toast, ask, fold, on: () => trainOn });
+                openSheet, closeSheet, sheetGestures, toast, ask, fold, on: () => trainOn, food, daily: () => daily });
+  food.mount({ sb: () => sb, esc, row, ICON, addRow, writeUser, shrink, dataUrl, url: SUPABASE_URL, anon: SUPABASE_ANON_KEY, demo: DEMO, keep, load,
+               openSheet, closeSheet, sheetGestures, rerender: () => render() });
   setInterval(tickClock, 60000);
   if (DEMO) {
     user = { email: "Demo" };
@@ -102,7 +112,8 @@ async function connect() {
   sb.auth.onAuthStateChange((event, s) => setTimeout(() => {
     if (!s?.user) { if (event === "INITIAL_SESSION" || event === "SIGNED_OUT") signedOut(); return; }
     if (event === "INITIAL_SESSION" || (event === "SIGNED_IN" && s.user.id !== user?.id)) {
-      user = { id: s.user.id, email: s.user.email };
+      const meta = s.user.user_metadata ?? {};
+      user = { id: s.user.id, email: s.user.email, name: meta.given_name ?? meta.full_name?.split(" ")[0] ?? null }; // Nexi's prompts use the first name
       keep("user", user);
       refresh();
     }
@@ -110,9 +121,13 @@ async function connect() {
 }
 
 function signedOut() {
-  user = null; cards = []; byId = new Map(); tasks = []; applications = []; events = []; brief = null; notes = []; pings = []; loaded = false;
-  modules = []; lectures = []; practice = []; noteById = new Map(); stack = [{ s: "home" }]; reviewing = false;
-  localStorage.removeItem(PREFIX + "user"); // the outbox stays, and syncs after the next sign-in
+  user = null; cards = []; byId = new Map(); tasks = []; applications = []; events = []; brief = null; notes = []; pings = []; messages = []; loaded = false;
+  chats.clear(); replies.clear(); drafting.clear(); materials.clear(); nx = null; how = ""; sheetItem = null; // message bodies, drafts and chats never outlive the session
+  for (const d of ["item-sheet", "nexi-sheet"]) if ($(d).open) $(d).close();
+  modules = []; lectures = []; practice = []; noteById = new Map(); stack = [{ s: "home" }]; reviewing = false; daily = []; dailyReady = false;
+  // Everything this account's data left on the phone (the cache holds message bodies). The outbox and captures stay, and
+  // sync after the next sign-in; Sign out removes those too.
+  for (const k of ["cache", "user", "synced", "daily", "nexi-chat", "lecture-notes"]) localStorage.removeItem(PREFIX + k);
   render();
   showSignIn();
 }
@@ -142,22 +157,27 @@ async function all(kind, select) {
 async function refresh() {
   if (!sb || !user) return;
   tried = Date.now();
+  const uid = user.id, gone = () => user?.id !== uid; // signed out (or another account) while this was in flight: write nothing back
   try {
     const today = todayString();
-    const [c, a, t, ap, ev, b, n, mo, le, pr, ln, pg] = await Promise.all([
+    const [c, a, t, ap, ev, b, n, mo, le, pr, ln, pg, ms] = await Promise.all([
       all("card", "id,module,title,data,user_data,updated_at"), all("assessment", "id,source,module,title,data,date,user_data"),
       all("task", "id,source,title,date,data,user_data,created_at,updated_at"), all("application", "id,title,date,data,user_data"),
       run(items("event", "id,title,date,data,user_data").gte("date", addDays(today, -14)).lte("date", addDays(today, 7))), // earlier ones may still be running; Up next runs to Sunday
       run(items("brief", "id,date,data").eq("date", today).limit(1)),
       run(items("quicknote", "id,source,title,data,user_data,created_at").order("created_at", { ascending: false }).limit(50)),
-      all("module", "id,module,title,data"), all("lecture", "id,module,date,title,data,user_data"),
+      all("module", "id,module,title,data,updated_at"), all("lecture", "id,module,date,title,data,user_data"),
       all("practice", "id,module,title,data,user_data,updated_at"), all("note", "id,module,date,title,data,user_data,updated_at"),
       // ponytail: the last 30 days of pings; page further back if the Inbox ever needs older ones.
       run(items("ping", "id,title,date,data,user_data,updated_at").gte("date", addDays(today, -30)).lte("date", addDays(today, 7))),
+      // Priority messages, mirrored by the Mac (v2 design §1). Before the `message` migration this is just [].
+      all("message", "id,title,date,data,user_data,updated_at"),
     ]);
+    if (gone()) return;
     // Off the critical path: before the gym migration is applied the query fails, and Today must still load.
-    if (trainOn) all("gym", "id,kind,source,date,title,data,user_data,created_at,updated_at,deleted_at").then(train.setRows, () => {});
-    const fresh = { cards: c, assessments: a, tasks: t, applications: ap, events: ev, brief: b[0] ?? null, notes: n, modules: mo, lectures: le, practice: pr, pings: pg };
+    if (trainOn) all("gym", "id,kind,source,date,title,data,user_data,created_at,updated_at,deleted_at").then((r) => { if (!gone()) { train.setRows(r); food.setRows(r); } }, () => {});
+    run(items("gym", "id,source,date,title,data,user_data,created_at,updated_at").like("id", "daily-%").gte("date", addDays(today, -8))).then((r) => { if (!gone()) setDaily(r); }, () => {});
+    const fresh = { cards: c, assessments: a, tasks: t, applications: ap, events: ev, brief: b[0] ?? null, notes: n, modules: mo, lectures: le, practice: pr, pings: pg, messages: ms };
     // Lecture notes are the bulk (~25 KB each with their doc), so they get their own key: if they ever outgrow
     // localStorage, only offline reading is lost, never the cards and the outbox.
     // ponytail: localStorage for notes; move them to IndexedDB if a term's worth stops fitting (about 5 MB).
@@ -169,12 +189,15 @@ async function refresh() {
     synced = Date.now(); keep("synced", synced);
     signThumbs();
   } catch (e) {
+    if (gone()) return;
     cloud = loaded ? "Couldn’t reach Sidebrain. Showing what’s saved on this phone." : `Couldn’t load: ${e.message || "network error"}`;
   }
   render();
   routePending(true);
   flush();
-  reminders = await reminderStatus();
+  const status = await reminderStatus();
+  if (gone()) return;
+  reminders = status;
   render();
 }
 
@@ -200,15 +223,16 @@ function useData(d) {
   cards = withPending(merge(d.cards, cards));
   byId = new Map(cards.map((x) => [x.id, x]));
   tasks = withPending(merge([...(d.tasks ?? []).filter((x) => !added.some((a) => a.id === x.id)), ...added], tasks));
-  assessments = d.assessments ?? []; applications = d.applications ?? []; events = d.events ?? []; brief = d.brief ?? null; notes = d.notes ?? [];
-  modules = [...(d.modules ?? [])].sort((a, b) => ((a.data?.code ?? "") < (b.data?.code ?? "") ? -1 : 1));
+  assessments = withPending(merge(d.assessments, assessments)); applications = d.applications ?? []; events = d.events ?? []; brief = d.brief ?? null; notes = d.notes ?? [];
+  modules = modulesByName(d.modules ?? []);
   lectures = d.lectures ?? []; practice = withPending(merge(d.practice, practice)); pings = withPending(merge(d.pings, pings));
+  messages = withPending(merge(d.messages, messages));
   noteById = new Map(withPending(merge(d.lectureNotes, [...noteById.values()])).map((x) => [x.id, x]));
   loaded = true;
   if (!reviewing && (session.index === 0 || session.day !== todayString())) newSession(); // never reshuffle a session in progress, even on its first card
 }
 
-const saveCache = () => { if (!DEMO) keep("cache", { cards, assessments, tasks, applications, events, brief, notes, modules, lectures, practice, pings }); };
+const saveCache = () => { if (!DEMO) keep("cache", { cards, assessments, tasks, applications, events, brief, notes, modules, lectures, practice, pings, messages }); };
 
 // ---------- Writes ----------
 
@@ -340,6 +364,35 @@ function addRow(row) {
   flush();
 }
 
+/** Server daily rows in (S1): merged like the rest, with adds and writes still in the outbox kept, the last 9 days only. */
+function setDaily(fetched) {
+  const pending = new Map(outbox.filter((o) => o.user_data).map((o) => [o.id, o.user_data]));
+  const added = outbox.filter((o) => o.t === "gym" && o.row.id?.startsWith("daily-") && !fetched.some((f) => f.id === o.row.id)).map((o) => ({ ...o.row, created_at: o.at }));
+  const from = addDays(todayString(), -8);
+  daily = merge([...fetched, ...added], daily).map((x) => (pending.has(x.id) ? { ...x, user_data: pending.get(x.id) } : x)).filter((x) => x.date >= from);
+  dailyReady = true;
+  keep("daily", daily);
+  render();
+}
+/** Today's daily row: made on the first write of the day (S2), merged after that. */
+function dailyWrite(patch) {
+  const today = todayString(), r = dailyOf(daily, today);
+  if (r) writeUser(r, patch, "edit");
+  else {
+    const row = { id: dailyId(today), kind: "gym", source: "you", module: null, deleted_at: null, date: today, title: "Daily", data: { type: "daily" }, user_data: { ...patch, userAt: Date.now() } };
+    daily.push({ ...row, created_at: new Date().toISOString() });
+    addRow(row);
+  }
+  keep("daily", daily);
+}
+/** Train's rows as train.js keeps them on this phone (read only: the Training lane owns train.js). */
+function trainState() {
+  if (!trainOn) return { on: false };
+  const rows = load("gym", []).filter((r) => !r.deleted_at);
+  // Meals come from Food (food.js keeps them under its own key since Food v2), so a meal logged a minute ago counts.
+  return { on: true, profile: rows.find((r) => r.id === "gym-profile")?.user_data ?? null, sessions: rows, food: food.today() };
+}
+
 // ---------- Sync ----------
 
 let flushing = false;
@@ -375,8 +428,9 @@ function rollback(op) {
     tasks = tasks.filter((x) => x.id !== op.row.id);
     captures = captures.filter((x) => x.id !== op.row.id); keep("captures", captures);
   } else if (!outbox.slice(1).some((o) => o.id === op.id)) {
-    const item = [...cards, ...tasks, ...practice, ...pings, ...noteById.values()].find((x) => x.id === op.id);
+    const item = [...cards, ...tasks, ...practice, ...pings, ...messages, ...noteById.values(), ...assessments, ...daily].find((x) => x.id === op.id);
     if (item) item.user_data = op.before ?? {};
+    if (item && op.id.startsWith("daily-")) keep("daily", daily);
   }
   saveCache();
 }
@@ -568,10 +622,10 @@ function redirectSignIn() {
 
 async function signOut() {
   if (DEMO) {
-    for (const k of ["outbox", "captures", "reminders"]) localStorage.removeItem(PREFIX + k);
+    for (const k of ["outbox", "captures", "reminders", "daily", "nexi-chat", "lecture-notes"]) localStorage.removeItem(PREFIX + k);
     return location.reload();
   }
-  for (const k of ["outbox", "captures", "cache", "user", "synced"]) localStorage.removeItem(PREFIX + k);
+  for (const k of ["outbox", "captures"]) localStorage.removeItem(PREFIX + k); // signedOut() clears the rest
   outbox = []; captures = [];
   closeSheet($("sheet"));
   navigator.clearAppBadge?.().catch(() => {});
@@ -602,16 +656,17 @@ const TABS = ["today", "study", "inbox", "train"];
 function render() {
   const signedIn = !!user, today = todayString(), root = document.documentElement;
   const pushed = signedIn && tab === "study" && stack.length > 1;
+  const deep = pushed || (signedIn && tab === "train" && trainOn && train.depth() > 0); // Train pushes History, a session, an exercise, Edit plan
   root.classList.toggle("reviewing", signedIn && reviewing);
   $("signin").hidden = signedIn;
   $("dock").hidden = !signedIn;
   if (tab === "train" && !trainOn) tab = "today"; // before the pages show, so turning Train off on its own tab lands on Today
   for (const t of TABS) $(t).hidden = !signedIn || tab !== t;
   $("review").hidden = !(signedIn && reviewing);
-  $("back").hidden = !pushed;
-  $("account").hidden = !signedIn || pushed;
+  $("back").hidden = !deep;
+  $("account").hidden = !signedIn || deep;
   $("account").textContent = (user?.email || "?")[0].toUpperCase();
-  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", inbox: "Inbox", train: "Train" }[tab];
+  $("bar-title").textContent = !signedIn ? "Sidebrain" : tab === "study" ? screenTitle(top()) : { today: "Today", inbox: "Inbox", train: train.title() }[tab];
   $("tabs").querySelector('[data-tab="train"]').hidden = !trainOn;
   $("tabs").style.setProperty("--n", trainOn ? 4 : 3);
   $("tabs").style.setProperty("--i", TABS.indexOf(tab));
@@ -621,6 +676,9 @@ function render() {
   if (signedIn && loaded) navigator.setAppBadge?.(due(cards, today).length).catch(() => {});
   $("read-all").hidden = true; // renderInbox shows it on the Inbox while something is unread
   if (signedIn) { renderToday(today); renderStudy(today); renderReview(today); renderCaptures(); renderInbox(); renderSheet(); if (trainOn) train.render(); }
+  if (signedIn && $("item-sheet").open) renderItem();
+  if (signedIn && $("nexi-sheet").open) renderNexi();
+  $("ask").hidden = !signedIn || tab !== "today" || reviewing;
   // The day sheet lives on Today only, under the hero; the tab bar's scroll edge then fades into the sheet's colour.
   const day = signedIn && tab === "today" && !reviewing && todaySheet;
   $("day").hidden = $("scrim").hidden = !day;
@@ -628,7 +686,7 @@ function render() {
   if (day) daySheet.layout(); else daySheet.focusable();
   $("contents").hidden = !pushed || !screenSections.length;
   $("more").hidden = !pushed || !screenMore;
-  root.classList.toggle("pushed", pushed);
+  root.classList.toggle("pushed", deep);
   if ($("contents").hidden && menuFor === "contents" || $("more").hidden && menuFor === "more") setMenu(null, true);
   updateSection();
   watchTitle();
@@ -674,6 +732,8 @@ const ICON = {
   note: svg(`<path d="M5.25 4.75h13.5v9.5l-4.5 4.5h-9z"/><path d="M14.25 18.75v-4.5h4.5M8.5 9h7M8.5 12.5h4"/>`),
   pin: svg(`<path d="M12 21s-6.25-5.4-6.25-10.5a6.25 6.25 0 0 1 12.5 0C18.25 15.6 12 21 12 21z"/><circle cx="12" cy="10.5" r="2.25"/>`),
   contrast: svg(`<circle cx="12" cy="12" r="8.25"/><path d="M12 3.75a8.25 8.25 0 0 1 0 16.5z" fill="currentColor" stroke="none"/>`),
+  mail: svg(`<rect x="3.25" y="5.25" width="17.5" height="13.5" rx="2.5"/><path d="M3.75 7.25l8.25 6 8.25-6"/>`),
+  bubble: svg(`<path d="M12 4.25c4.56 0 8.25 3.13 8.25 7s-3.69 7-8.25 7c-1.1 0-2.15-.18-3.1-.52L4.75 19.5l1.2-3.6c-1.4-1.3-2.2-2.9-2.2-4.65 0-3.87 3.69-7 8.25-7z"/>`),
   tray: svg(`<path d="M3.75 13.25l2.6-7.1a1.5 1.5 0 0 1 1.4-.9h8.5a1.5 1.5 0 0 1 1.4.9l2.6 7.1v4.5a1.5 1.5 0 0 1-1.5 1.5H5.25a1.5 1.5 0 0 1-1.5-1.5zM3.75 13.25H8.5l1 2h5l1-2h4.75"/>`),
   dumbbell: svg(`<path d="M3.25 9.5v5M6.25 7v10M17.75 7v10M20.75 9.5v5M6.25 12h11.5"/>`),
   tickMark: `<svg class="check-glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12.5l4.25 4.25L18.5 7.5"/></svg>`,
@@ -711,10 +771,12 @@ const notices = () => [syncError && `<p class="foot warn">${esc(syncError)}</p>`
 let todaySheet = false; // the day sheet shows only when Today has content (not while loading, not on the empty state)
 
 function renderToday(today) {
-  const top = head("Today", longDate()) + notices();
   todaySheet = false;
-  if (!loaded) return paint($("today"), top + SKELETON);
+  if (!loaded) return paint($("today"), head("Today", longDate()) + notices() + SKELETON);
   const now = Date.now(), at = new Date(now);
+  const ts = trainState(), top = head("Today", longDate()) + notices() + checkinHtml(at, ts);
+  const rugbyLine = trainOn ? RUGBY_LINE[rugbyOn(daily, today)] : null;
+  sugRows = tab === "today" ? suggestNow(at, ts) : [];
   const sched = daySchedule(events, at, 0, true);
   const p = brief?.date?.slice(0, 10) === today && typeof brief.data?.priority?.title === "string" && brief.data.priority.title ? brief.data.priority : null; // only today's brief, as on the Mac
   // The priority, when it is one of the tasks, gets that task's tick, and the task leaves To do.
@@ -736,10 +798,10 @@ function renderToday(today) {
   const weekDue = rows.filter((r) => r.days >= 1 && r.date.slice(0, 10) <= lastDay);
   const later = runway(assessments.filter((a) => !gone(a)), today);
   const hero = heroEvent(events, at);
-  const hasDay = sched.allDay.length || sched.past.length || sched.now.length || sched.next.length;
+  const hasDay = rugbyLine || sched.allDay.length || sched.past.length || sched.now.length || sched.next.length;
   const foot = `<p class="${hasDay || rows.length || cardsDue ? "day-foot" : "foot mt-28"}" id="today-foot"></p>`;
 
-  if (!hero && !hasDay && !p && !cardsDue && !rows.length && !later.length) {
+  if (!hero && !hasDay && !p && !cardsDue && !rows.length && !later.length && !sugRows.length) {
     paint($("today"), top + empty(ICON.sun, "Nothing due", "Deadlines, classes and to-dos show up here.",
       `<button class="btn secondary" type="button" data-act="add">Add a to-do</button>${foot}`).replace('class="empty"', 'class="empty fill"'));
     return updateFoot();
@@ -760,6 +822,8 @@ function renderToday(today) {
     return row({ tag: b || gym ? "button" : "div", attrs: `data-item="${esc(e.id)}"${b ? ` data-open="note:${esc(b.id)}"` : gym ? ` data-act="gym"` : ""}`, lead: time(e.time), title: esc(e.title),
       sub: esc([b && briefLabel(b), place(e.location)].filter(Boolean).join(" · ")), chev: !!b || gym }).replace("<li>", `<li class="${cls}">`); };
   const tl = [];
+  // K7: the check-in's answer is its own all-day line; tapping it clears the answer and asks again.
+  if (rugbyLine) tl.push(row({ tag: "button", attrs: `data-act="rugby-clear" aria-label="${esc(rugbyLine)}. Change the answer"`, lead: time("All day"), title: esc(rugbyLine), titleCls: "one" }));
   if (sched.allDay.length) tl.push(row({ lead: time("All day"), title: esc(sched.allDay.join(", ")), titleCls: "one" }));
   if (sched.past.length) tl.push(fold("earlier", `${sched.past.length} earlier`, null, sched.past.map((e) => event(e, "past")).join(""), "tl"));
   for (const e of sched.now) tl.push(event(e, "now"));
@@ -781,12 +845,13 @@ function renderToday(today) {
     tl.push(fold("week", "Rest of the week", week.length, body, "tl"));
   }
   const big = later[0];
-  paint($("day-scroll"), `<p class="caption-h">To do</p>
+  paint($("day-scroll"), `${sugRows.length ? `<p class="caption-h">Suggestions</p><ul class="list sugs">${sugRows.map(sugRow).join("")}</ul>` : ""}
+    <p class="caption-h">To do</p>
     ${todo.length ? `<ul class="list ticks">${todo.join("")}</ul>` : `<p class="foot empty-line">Nothing due today.</p>`}
     <p class="caption-h">Today</p><ul class="list tl">${tl.join("")}</ul>
     ${big ? `<p class="day-foot" data-item="${esc(big.id)}">Next big deadline: ${esc(big.title)} in ${esc(big.left)}</p>` : ""}${foot}`);
   const open = toDo.concat(slipped).filter((r) => !(held.get(r.id)?.kind === "done")).length + (cardsDue ? 1 : 0);
-  $("day-sum-text").textContent = `${open ? `${count(open)} to do` : "Nothing to do"} · ${sched.next.length ? `${count(sched.next.length)} more today` : "Nothing else today"}`;
+  $("day-sum-text").textContent = `${sugRows.length ? `${plural(sugRows.length, "suggestion")} · ` : ""}${open ? `${count(open)} to do` : "Nothing to do"} · ${sched.next.length ? `${count(sched.next.length)} more today` : "Nothing else today"}`;
   updateFoot();
 }
 const cmpDay = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -798,7 +863,63 @@ const place = (s) => { if (!/^https?:\/\//i.test(s ?? "")) return s ?? "";
   try { const h = new URL(s).hostname; return /teams\./.test(h) ? "Teams" : /zoom\./.test(h) ? "Zoom" : h.replace(/^www\./, ""); } catch { return "Online"; } };
 /** Train's hook for a gym event (train.openToday lands from the Train branch; until then the Train tab opens). */
 const GYM = /\bgym\b/i;
-const gymHook = () => trainOn;
+const gymHook = () => trainOn && rugbyOn(daily, todayString()) !== "match"; // a match day: nothing in the gym (K3 table)
+
+// ---------- The morning check-in (K1–K9) and Suggestions (G1–G11): the rules are in nudges.js ----------
+
+function checkinHtml(at, ts) {
+  if (!dailyReady || !showCheckin({ now: at, on: ts.on, profile: ts.profile, daily })) return "";
+  const btn = (v, label) => `<button class="btn secondary" type="button" data-act="rugby" data-v="${v}">${label}</button>`;
+  const two = checkinStep === 2;
+  // One line (the question, with the caption or Back at its end) over the answers: the same height for both questions.
+  return `<section class="checkin" aria-label="Check-in"><div class="qrow"><h2 class="q" id="checkin-q">${two ? "What is rugby doing?" : "Rugby today?"}</h2>${two
+      ? `<button class="link back-q" type="button" data-act="rugby" data-v="back">Back</button>` : `<p class="cap">Check-in</p>`}</div>
+    <div class="answers" role="group" aria-labelledby="checkin-q" style="--n: ${two ? 3 : 2}">${two ? btn("training", "Training") + btn("match", "Match") + btn("rest", "Rest") : btn("yes", "Yes") + btn("no", "No")}</div></section>`;
+}
+function answer(v) {
+  if (v === "yes" || v === "back") { checkinStep = v === "yes" ? 2 : 1; render(); return $("today").querySelector(".checkin [data-v]:not(.back-q)")?.focus({ preventScroll: true }); }
+  checkinStep = 1;
+  dailyWrite({ rugby: v, answeredAt: Date.now() });
+  render();
+}
+
+/** G1–G5 for now; records today's shown list the first time a key appears (G3). */
+function suggestNow(at, ts) {
+  if (!user || !dailyReady) return [];
+  const { rows, shown } = suggestions({ now: at, prefsOn: sugOn, daily, pings, train: ts, assessments, applications, cards, events, modules,
+                                        notes: [...noteById.values()], lectures });
+  if (shown) dailyWrite({ shown });
+  return rows;
+}
+const SUG_GLYPH = { app: "briefcase", ms: "cap", start: "cap", cards: "cards", read: "doc", missed: "dumbbell", "train-today": "dumbbell", food: "dumbbell" };
+function sugRow(c) {
+  const k = esc(c.key);
+  return `<li class="sug"><button class="row" type="button" data-act="sug" data-key="${k}">${ICON[SUG_GLYPH[c.key.split(":")[0]]]}<span class="text"><span class="title clamp">${esc(c.title)}</span><span class="subtitle">${esc(c.sub)}</span></span></button>${
+    c.started ? `<button class="btn secondary small" type="button" data-act="sug-started" data-key="${k}" aria-label="Started: ${esc(c.title)}">Started</button>` : ""}<button class="circle" type="button" data-act="sug-more" data-key="${k}" aria-label="More: ${esc(c.title)}">${ICON.more}</button></li>`;
+}
+/** G6: the key goes into acted, then its target opens. */
+function sugAct(key, started = false) {
+  const c = sugRows.find((x) => x.key === key), today = todayString();
+  if (!c) return;
+  dailyWrite({ acted: [...(dailyOf(daily, today)?.user_data?.acted ?? []), key] });
+  if (started) {
+    const a = assessments.find((x) => x.id === c.started);
+    if (a) writeUser(a, { startedAt: Date.now() }, "edit");
+    toast("Marked as started");
+    return render();
+  }
+  render();
+  if (!openTarget(c.open)) tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
+}
+/** G5: Snooze 3 days or Dismiss 7, from the More sheet. */
+function sugMute(kind) {
+  const today = todayString(), key = sugKey, was = dailyOf(daily, today)?.user_data?.muted ?? {};
+  closeSheet($("sug-sheet"));
+  if (!key) return;
+  dailyWrite({ muted: { ...was, [key]: muteUntil(today, kind) } });
+  render();
+  toast(kind === "snooze" ? "Snoozed for 3 days" : "Dismissed for 7 days", () => { dailyWrite({ muted: was }); render(); });
+}
 
 /** What now: the event on now (with a progress track), else the next one today, else the next day's first; one prep action. */
 function heroHtml(e, briefAt, at) {
@@ -927,90 +1048,95 @@ function openTaskSheet(id) {
   openSheet($("task-sheet"));
 }
 
-// ---------- Inbox: every ping that has fired (docs/(C) Brief + ping contract.md §6) ----------
+// ---------- Inbox: Priority messages on top, then every ping that has fired (contract §6); a tap opens the item sheet ----------
 
-const PING_GLYPH = { moodle: "books", recording: "books", notes: "doc", brief: "doc", reask: "doc", readings: "doc", deadline: "clock", exam: "clock", application: "briefcase" };
+const PING_GLYPH = { moodle: "books", recording: "books", notes: "doc", brief: "doc", reask: "doc", readings: "doc", deadline: "clock", exam: "clock", application: "briefcase",
+  email: "mail", nudge: "clock", room: "clock" };
+const KIND = { brief: "Brief", nudge: "Class", reask: "Recall", readings: "Readings", deadline: "Deadline", exam: "Exam", application: "Application", moodle: "Moodle",
+  recording: "Recording", notes: "Notes", room: "Class change", email: "Email", grade: "Grade", group: "Group work", event: "Event" };
+const SERVICE_GLYPH = { gmail: "mail", outlook: "mail", whatsapp: "bubble", linkedin: "person" };
 
 /** A Moodle ping from one sync carries `counts` per module (PingDetect.moodle, 17 Oct): more than one item reads as one
- *  batched row, "Moodle · 3 new" over "M&S, CRG". Anything else keeps its own title. */
+ *  batched row, "Moodle · 3 new" over "M&S, CRG". Anything else keeps its own title over its kind and module. */
 function pingText(p) {
   const counts = p.data?.kind === "moodle" && p.data?.counts && typeof p.data.counts === "object" ? Object.entries(p.data.counts) : [];
   const n = counts.reduce((a, [, v]) => a + (Number(v) || 0), 0);
-  return n > 1 ? { title: `Moodle · ${n} new`, sub: counts.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([m]) => m).join(", ") } : { title: p.title ?? "Notification", sub: "" };
+  return n > 1 ? { title: `Moodle · ${n} new`, sub: counts.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([m]) => m).join(", ") }
+    : { title: p.title ?? "Notification", sub: [KIND[p.data?.kind], typeof p.data?.module === "string" && short(p.data.module)].filter(Boolean).join(" · ") };
 }
 
-let inboxAll = false; // "Show N older" was tapped: Earlier shows every row
-const EARLIER = 20;
+/** What the Inbox holds: message conversations, and the pings still in it (less the email pings a message stands for). */
+function inboxState(now = new Date()) {
+  const folded = foldedPings(messages), box = inbox(pings.filter((p) => !folded.has(p.id)), now), convs = conversations(messages, now);
+  const rows = box.rows.filter((p) => p.user_data?.done !== true), unseen = [...rows.filter((p) => !p.user_data?.seenAt), ...convs.filter((c) => !c.rows.at(-1).user_data?.seenAt).map((c) => c.rows.at(-1))];
+  return { convs, rows, unseen, unread: box.unread + convs.filter((c) => !c.rows.at(-1).user_data?.seenAt).length };
+}
+/** A message thread: the conversation a row belongs to (oldest first), or just the row when it's done or snoozed. */
+function threadOf(id) {
+  const r = messages.find((x) => x.id === id);
+  return r ? conversations(messages).find((c) => c.rows.includes(r))?.rows ?? [r] : null;
+}
+
 function renderInbox() {
-  const { unread } = inbox(pings, new Date()), rows = inbox(pings, new Date()).rows.filter((p) => p.user_data?.done !== true);
+  const { convs, rows, unseen, unread } = inboxState();
   $("inbox-badge").textContent = unread > 9 ? "9+" : String(unread);
   $("inbox-badge").hidden = !unread;
   $("tabs").querySelector('[data-tab="inbox"]').setAttribute("aria-label", unread ? `Inbox, ${unread} unread` : "Inbox");
-  $("read-all").hidden = !(tab === "inbox" && unread);
+  $("read-all").hidden = !(tab === "inbox" && unseen.length);
   const top = head("Inbox") + notices();
   if (!loaded) return paint($("inbox"), top + SKELETON);
-  if (!rows.length) return paint($("inbox"), top + empty(ICON.tray, "Nothing new", "Briefs, deadlines and Moodle updates land here.").replace('class="empty"', 'class="empty fill"'));
+  if (!rows.length && !convs.length) return paint($("inbox"), top + empty(ICON.tray, "Nothing new", "Briefs, deadlines, Moodle and priority messages land here.").replace('class="empty"', 'class="empty fill"'));
+  // Swipe left = Done, right = Later; a tap opens the item sheet, which has both too (the VoiceOver path).
+  const swipe = (id, fresh, glyph, title, sub, time) => `<li class="ping${fresh ? " unread" : ""}" data-swipe="${esc(id)}"><div class="swipe-bg" aria-hidden="true"><span class="l">Later</span><span class="r">Done</span></div>
+    <div class="slide"><button class="row" type="button" data-ping="${esc(id)}" aria-label="${fresh ? "Unread. " : ""}${esc(title)}${sub ? ", " + esc(sub) : ""}, ${esc(time)}">${fresh ? `<i class="dot" aria-hidden="true"></i>` : ""}${glyph}<span class="text"><span class="title clamp">${esc(title)}</span>${sub ? `<span class="subtitle">${esc(sub)}</span>` : ""}</span><span class="trail">${esc(time)}</span></button></div></li>`;
   const today = todayString(), yesterday = addDays(today, -1), groups = new Map();
+  if (convs.length) groups.set("Priority", convs.map(({ latest: m, rows: t }) => swipe(m.id, !t.at(-1).user_data?.seenAt, ICON[SERVICE_GLYPH[m.service.toLowerCase()]] ?? ICON.mail, m.sender,
+    [m.service, m.subject || m.body.trim().split("\n")[0].slice(0, 120)].filter(Boolean).join(" · "), m.received ? when(m.received) : "")));
   for (const p of rows) {
-    const day = localDay(fireAt(p).getTime()), g = day === today ? "Today" : day === yesterday ? "Yesterday" : "Earlier";
+    const at = fireAt(p), day = localDay(at.getTime()), g = day === today ? "Today" : day === yesterday ? "Yesterday" : "Earlier", { title, sub } = pingText(p);
     if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push(p);
+    groups.get(g).push(swipe(p.id, !p.user_data?.seenAt, ICON[PING_GLYPH[p.data?.kind]] ?? ICON.bell, title, sub, day === today || day === yesterday ? clock(at) : shortDay(day)));
   }
-  const rowHtml = (p) => {
-    const fresh = !p.user_data?.seenAt, at = fireAt(p), day = localDay(at.getTime()), { title, sub } = pingText(p);
-    const time = day === today || day === yesterday ? clock(at) : shortDay(day);
-    // The swipes have no VoiceOver or Switch Control path, so each row also has a hidden button for its sheet.
-    return `<li class="ping${fresh ? " unread" : ""}" data-swipe="${esc(p.id)}"><div class="swipe-bg" aria-hidden="true"><span class="l">Later</span><span class="r">Done</span></div>
-      <div class="slide"><button class="row" type="button" data-ping="${esc(p.id)}" aria-label="${fresh ? "Unread. " : ""}${esc(title)}${sub ? ", " + esc(sub) : ""}, ${esc(time)}">${fresh ? `<i class="dot" aria-hidden="true"></i>` : ""}${ICON[PING_GLYPH[p.data?.kind]] ?? ICON.bell}<span class="text"><span class="title clamp">${esc(title)}</span>${sub ? `<span class="subtitle">${esc(sub)}</span>` : ""}</span><span class="trail">${esc(time)}</span></button></div>
-      <button class="sr-only" type="button" data-pmore="${esc(p.id)}">Snooze or mark done: ${esc(title)}</button></li>`;
-  };
-  paint($("inbox"), top + [...groups].map(([g, ps]) => {
-    const cut = g === "Earlier" && !inboxAll && ps.length > EARLIER + 2 ? ps.length - EARLIER : 0; // never "Show 1 older"
-    return `<p class="caption-h" role="heading" aria-level="2">${g}</p><ul class="group inbox">${ps.slice(0, ps.length - cut).map(rowHtml).join("")}${cut
-      ? row({ tag: "button", attrs: `data-act="inbox-older"`, title: `Show ${cut} older`, cls: "more" }) : ""}</ul>`;
-  }).join(""));
+  paint($("inbox"), top + [...groups].map(([g, html]) => `<p class="caption-h" role="heading" aria-level="2">${g}</p><ul class="group inbox">${html.join("")}</ul>`).join(""));
 }
 
-/** A ping's sheet (hold a row, or its hidden button): Open, Snooze (1 h, 20:00 tonight, 08:00 tomorrow) and Mark as done. */
-function openPingSheet(id) {
-  const p = pings.find((x) => x.id === id);
-  if (!p) return;
-  sheetPing = id;
-  say("ping-title", pingText(p).title);
-  const at = fireAt(p);
-  say("ping-when", [pingText(p).sub, at && `${when(at.getTime())}${localDay(at.getTime()) === todayString() ? "" : ", " + clock(at)}`].filter(Boolean).join(" · "));
-  $("ping-moves").innerHTML = (typeof p.data?.open === "string" ? row({ tag: "button", attrs: "data-popen", lead: ICON.open, title: "Open" }) : "")
-    + snoozeChoices(new Date()).map(([label, d]) =>
-      row({ tag: "button", attrs: `data-snooze="${d.toISOString().replace(/\.\d{3}Z$/, "Z")}"`, lead: ICON.clock, title: label, trail: clock(d) })).join("");
-  openSheet($("ping-sheet"));
+const isoZ = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+const dayClock = (d) => (localDay(d.getTime()) === todayString() ? clock(d) : `${dayName(localDay(d.getTime()))} ${clock(d)}`);
+/** Later's choices: a ping's snoozes (1 h, 20:00, 08:00 tomorrow); a message's match the Mac's Snooze menu (+3 h, 08:00 tomorrow). */
+function laterChoices(message, now = new Date()) {
+  if (!message) return snoozeChoices(now);
+  const morning = new Date(now); morning.setDate(morning.getDate() + 1); morning.setHours(8, 0, 0, 0);
+  const later = new Date(now.getTime() + 3 * 36e5);
+  return [...(localDay(later.getTime()) === localDay(now.getTime()) ? [["Later today", later]] : []), ["Tomorrow morning", morning]]; // after 21:00, only the morning
 }
 
-/** Swipe left = Done, right = Later (the first snooze, an hour), then a 5 s Undo that puts user_data back as it was. */
-function triage(id, done) {
-  const p = pings.find((x) => x.id === id);
-  if (!p) return;
-  const was = p.user_data ?? {}, keys = done ? ["done", "doneAt", "seenAt"] : ["snoozedUntil", "seenAt"];
-  const later = snoozeChoices(new Date())[0][1];
-  pingWrite(id, done ? { done: true, doneAt: Date.now() } : { snoozedUntil: later.toISOString().replace(/\.\d{3}Z$/, "Z"), seenAt: null });
+/** Done, or Later (the first choice, unless one was picked), then a 5 s Undo that puts user_data back as it was. A message
+ *  is done or snoozed with its whole conversation. */
+function triage(id, done, until = null) {
+  const list = threadOf(id) ?? pings.filter((x) => x.id === id);
+  if (!list.length) return;
+  const later = until ?? laterChoices(messages.includes(list[0]))[0][1], was = list.map((x) => x.user_data ?? {});
+  const keys = done ? ["done", "doneAt", "seenAt"] : ["snoozedUntil", "seenAt"];
+  for (const x of list) writeUser(x, done ? { done: true, doneAt: Date.now(), seenAt: x.user_data?.seenAt ?? Date.now() } : { snoozedUntil: isoZ(later), seenAt: null }, "edit");
   render();
-  toast(done ? "Marked done" : `Snoozed until ${clock(later)}`, () => {
-    writeUser(p, Object.fromEntries(keys.map((k) => [k, was[k] ?? (k === "done" ? false : null)])), "edit");
+  toast(done ? "Marked done" : `Snoozed until ${dayClock(later)}`, () => {
+    list.forEach((x, i) => writeUser(x, Object.fromEntries(keys.map((k) => [k, was[i][k] ?? (k === "done" ? false : null)])), "edit"));
     render();
   });
 }
 
-/** Marks every unread ping in the Inbox seen, with Undo. */
+/** Marks everything unread in the Inbox seen, with Undo. */
 function readAll() {
-  const fresh = inbox(pings, new Date()).rows.filter((p) => !p.user_data?.seenAt && p.user_data?.done !== true);
-  for (const p of fresh) pingWrite(p.id, {});
+  const fresh = inboxState().unseen; // one per Inbox line (a chat's newest message stands for it)
+  for (const x of fresh) writeUser(x, { seenAt: Date.now() }, "edit");
   render();
-  toast(`${plural(fresh.length, "notification")} marked read`, () => { for (const p of fresh) writeUser(p, { seenAt: null }, "edit"); render(); });
+  toast(`${plural(fresh.length, "item")} marked read`, () => { for (const x of fresh) writeUser(x, { seenAt: null }, "edit"); render(); });
 }
 
 /** Inbox rows: 10 px of hysteresis, then a horizontal drag tracks 1:1 (vertical stays the page's scroll, touch-action pan-y).
  *  On release it commits past 40% of the width, or past 20% with a flick over .11 px/ms in the drag's direction (the lift
  *  counts, so a drag that pauses before it is not a flick); otherwise it snaps back. A row
- *  caught mid snap-back is picked up where it is. Holding still for 500 ms opens the ping's sheet. One pointer at a time. */
+ *  caught mid snap-back is picked up where it is. A tap opens the item sheet. One pointer at a time. */
 function inboxGestures(root) {
   let g = null;
   const label = (li, x) => { // the Done / Later label rides 16 px off the slide's edge once 88 px are open
@@ -1021,23 +1147,16 @@ function inboxGestures(root) {
   const place = (li, x) => { li.dataset.dir = x > 0 ? "r" : "l"; li.querySelector(".slide").style.transform = `translateX(${x}px)`; label(li, x); };
   root.addEventListener("pointerdown", (e) => {
     const li = e.target.closest("[data-swipe]");
-    if (g || !li || e.button > 0 || li.dataset.leaving || e.target.closest("[data-pmore]")) return;
+    if (g || !li || e.button > 0 || li.dataset.leaving) return;
     const slide = li.querySelector(".slide"), at = new DOMMatrix(getComputedStyle(slide).transform).m41;
     slide.getAnimations().forEach((a) => a.cancel());
-    g = { li, id: e.pointerId, x: e.clientX - at, y: e.clientY, on: Math.abs(at) > .5, held: false, hist: [[e.timeStamp, e.clientX]] };
-    if (g.on) { place(li, at); try { li.setPointerCapture(e.pointerId); } catch { /* not capturable */ } return; }
-    g.hold = setTimeout(() => {
-      if (!g || g.on) return;
-      g.held = true; // kept until the lift, so the lift can't land on the sheet it opened
-      try { li.setPointerCapture(g.id); } catch { /* not capturable */ }
-      openPingSheet(li.dataset.swipe);
-    }, 500);
+    g = { li, id: e.pointerId, x: e.clientX - at, y: e.clientY, on: Math.abs(at) > .5, hist: [[e.timeStamp, e.clientX]] };
+    if (g.on) { place(li, at); try { li.setPointerCapture(e.pointerId); } catch { /* not capturable */ } }
   });
   addEventListener("pointermove", (e) => {
-    if (!g || e.pointerId !== g.id || g.held) return;
+    if (!g || e.pointerId !== g.id) return;
     const dx = e.clientX - g.x, dy = e.clientY - g.y;
     if (!g.on) {
-      if (Math.hypot(dx, dy) > 10) clearTimeout(g.hold);
       if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { g = null; return; }
       if (Math.abs(dx) < 10) return;
       g.on = true; g.x += Math.sign(dx) * 10; // no jump at the threshold
@@ -1048,8 +1167,6 @@ function inboxGestures(root) {
   });
   const up = (e) => {
     if (!g || e.pointerId !== g.id) return;
-    clearTimeout(g.hold);
-    if (g.held) { g = null; suppressClick = Date.now() + 350; return; }
     g.hist.push([e.timeStamp, e.clientX]); while (g.hist.length > 2 && e.timeStamp - g.hist[0][0] > 100) g.hist.shift(); // the lift counts
     const { li, on, hist: h } = g, x = e.clientX - g.x, v = (h.at(-1)[1] - h[0][1]) / Math.max(1, h.at(-1)[0] - h[0][0]);
     g = null;
@@ -1071,21 +1188,279 @@ function inboxGestures(root) {
       li.animate([{ height: li.offsetHeight + "px" }, { height: 0 }], { duration: 220, easing: DRAWER, fill: "forwards" }).onfinish = () => triage(id, done);
   };
   addEventListener("pointerup", up); addEventListener("pointercancel", up);
-  root.addEventListener("contextmenu", (e) => { const li = e.target.closest("[data-swipe]"); if (li) { e.preventDefault(); openPingSheet(li.dataset.swipe); } });
 }
 
-/** Open, Done and Snooze write user_data (with userAt, as every write does). Open and Done mark the ping seen; Snooze
- *  clears seenAt, so it comes back unread when it fires again (as on the Mac). */
+/** Opening writes seenAt (with userAt, as every write does); Snooze clears it, so it comes back unread when it fires again (as on the Mac). */
 function pingWrite(id, patch) {
   const p = pings.find((x) => x.id === id);
   if (!p) return null;
   writeUser(p, { ...(p.user_data?.seenAt ? {} : { seenAt: Date.now() }), ...patch }, "edit");
   return p;
 }
-function openPing(id) {
-  const p = pingWrite(id, {});
+
+// ---------- The item sheet: an Inbox row opened over the Inbox, never a jump to another tab (Ricky, 20 Oct) ----------
+// A brief inline with Listen, a deadline with its milestones, a Moodle batch's links, a note's summary, or a message with
+// a draft reply to copy. Done and Later sit at the bottom; Open in Study is the secondary way out.
+
+let sheetItem = null, laterOpen = false, itemAsk = null, copied = null;
+const replies = new Map();   // message id → the draft reply on screen (this session only, never synced)
+const drafting = new Map();  // message id → true while drafting, else the error to show
+const materials = new Map(); // Moodle ping id → its materials, null while loading, false when they couldn't load
+let how = "";                // "How should it sound?" for the next Redraft
+
+/** Opens an Inbox row (or an email ping's message). False when it isn't on this phone. */
+function openItem(id) {
+  const fold = messages.find((m) => m.data?.ping === id);
+  if (fold) { pingWrite(id, {}); id = fold.id; }
+  const p = pings.find((x) => x.id === id), list = !p && threadOf(id);
+  if (!p && !list) return false;
+  sheetItem = p ? id : list.at(-1).id; laterOpen = false; copied = null;
+  if (p) {
+    pingWrite(id, {});
+    const t = String(p.data?.open ?? "");
+    if (/^(note|listen|reask):/.test(t)) foldsFor(t.slice(t.indexOf(":") + 1)).reask = t.startsWith("reask:");
+  } else for (const r of list) if (!r.user_data?.seenAt) writeUser(r, { seenAt: Date.now() }, "edit");
   render();
-  if (p && typeof p.data?.open === "string" && !openTarget(p.data.open)) tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
+  renderItem();
+  openSheet($("item-sheet"));
+  $("item-sheet").scrollTop = 0;
+  return true;
+}
+
+function renderItem() {
+  const p = pings.find((x) => x.id === sheetItem), list = !p && threadOf(sheetItem);
+  if (!p && !list) return closeSheet($("item-sheet")); // done or gone on another device
+  const v = p ? pingView(p) : messageSheet(list);
+  itemAsk = v.ask;
+  say("item-title", v.title);
+  say("item-meta", v.meta);
+  const ask = v.ask ? `<button class="btn secondary small" type="button" data-act="ask-item">${ICON.bubble}Ask Nexi</button>` : "";
+  if (paint($("item-body"), v.body + (v.links || ask ? `<div class="actions wrap">${v.links}${ask}</div>` : ""))) {
+    const ta = $("draft-text"), hw = $("draft-how");
+    if (ta) ta.value = replies.get(sheetItem) ?? messageView(list.at(-1)).draft;
+    if (hw) hw.value = how;
+  }
+  paint($("item-foot"), `${laterOpen ? `<ul class="group later">${laterChoices(!p).map(([label, d]) =>
+      row({ tag: "button", attrs: `data-later="${isoZ(d)}"`, lead: ICON.clock, title: label, trail: dayClock(d) })).join("")}</ul>` : ""}
+    <div class="actions"><button class="btn secondary" type="button" data-act="item-later" aria-expanded="${laterOpen}">Later</button>
+      <button class="btn ${p ? "primary" : "secondary"}" type="button" data-act="item-done">Done</button></div>`);
+}
+
+const studyButton = (target) => `<button class="btn secondary small" type="button" data-study="${esc(target)}">${ICON.books}Open in Study</button>`;
+const linkButton = (href, label, glyph = ICON.open) => `<a class="btn secondary small" href="${esc(href)}"${/^https:/.test(href) ? ` target="_blank" rel="noopener noreferrer"` : ""}>${glyph}${esc(label)}</a>`;
+const info = (rows) => `<ul class="group info">${rows.filter(Boolean).join("")}</ul>`;
+const CHIPS = { note: ["Explain this", "Quiz me"], item: ["Explain this", "What first?"] };
+
+/** A ping's sheet, by what it opens. */
+function pingView(p) {
+  const t = String(p.data?.open ?? ""), i = t.indexOf(":"), kind = i > 0 ? t.slice(0, i) : t, id = t.slice(i + 1), at = fireAt(p), { title, sub } = pingText(p);
+  const v = { title, meta: [sub, at && when(at.getTime()) + (localDay(at.getTime()) === todayString() ? "" : ", " + clock(at))].filter(Boolean).join(" · "), body: "", links: "",
+    ask: { key: `ping:${p.id}`, label: title, chips: CHIPS.item, context: () => `Notification: ${title}${sub ? ` (${sub})` : ""}` } };
+  const today = todayString();
+  if (["note", "listen", "reask"].includes(kind)) {
+    const n = id === "next" ? nextBrief([...noteById.values()]) : noteById.get(id);
+    if (n) {
+      const isBrief = n.data?.kind === "pre", classAt = Date.parse(n.data?.classAt);
+      if (isBrief) v.meta = [briefLabel(n), classAt && `Class ${dayClock(new Date(classAt)).replace(/^(Today|Tomorrow) /, (w) => w.toLowerCase())}`].filter(Boolean).join(" · ");
+      v.body = isBrief ? noteHtml(n, []) : summaryHtml(n);
+      v.links = studyButton(`note:${n.id}`);
+      v.ask = noteAsk(n);
+      return v;
+    }
+  }
+  if (kind === "item") {
+    const a = assessments.find((x) => x.id === id), ap = applications.find((x) => x.id === id), e = events.find((x) => x.id === id), tk = tasks.find((x) => x.id === id);
+    if (a) {
+      const due = typeof a.date === "string" ? a.date.slice(0, 10) : null, days = due ? daysBetween(today, due) : null;
+      const ms = (Array.isArray(a.data?.milestones) ? a.data.milestones : []).filter((m) => typeof m?.date === "string" && m.label).sort((x, y) => cmpDay(x.date, y.date));
+      v.body = info([row({ lead: ICON.clock, title: due ? `Due ${esc(dayName(due, today))}` : "No date yet", trail: days == null ? "" : days < 0 ? "Passed" : days === 0 ? "Today" : `in ${plural(days, "day")}` }),
+        a.data?.weight && row({ lead: ICON.cap, title: esc(`${a.data.weight} of ${short(a.module) || "the module"}`) })])
+        + (ms.length ? `<p class="caption-h">Milestones</p><ul class="group flat">${ms.map((m) => row({ title: esc(m.label), trail: esc(dayName(m.date.slice(0, 10), today)), cls: m.date.slice(0, 10) < today ? "past" : "" })).join("")}</ul>` : "");
+      v.links = a.module ? studyButton(`module:${a.module}`) : "";
+      v.ask.context = () => `Assessment: ${a.data?.title ?? a.title} (${a.module ?? ""}), due ${due ?? "no date"}, weight ${a.data?.weight ?? "unknown"}.\nMilestones: ${ms.map((m) => `${m.date.slice(0, 10)} ${m.label}`).join("; ") || "none"}\nToday: ${today}`;
+    } else if (ap) {
+      v.body = info([row({ lead: ICON.briefcase, title: esc([ap.data?.org, ap.data?.role].filter(Boolean).join(" · ") || ap.title || "Application"), sub: esc(ap.data?.stage ?? "") }),
+        ap.date && row({ lead: ICON.clock, title: `Closes ${esc(dayName(ap.date.slice(0, 10), today))}` })]);
+    } else if (e) {
+      const s = new Date(e.data?.start), where = place(e.data?.location ?? "");
+      v.body = info([row({ lead: ICON.clock, title: esc(e.data?.title ?? e.title ?? "Event"), sub: Number.isNaN(s.getTime()) ? "" : esc(dayClock(s)) }), where && row({ lead: ICON.pin, title: esc(where) })]);
+      if (where && !/^https?:/i.test(e.data?.location ?? "")) v.links = linkButton(`https://maps.apple.com/?q=${encodeURIComponent(where)}`, "Directions", ICON.pin);
+    } else if (tk) {
+      const d = effectiveDate(tk)?.slice(0, 10);
+      v.body = info([row({ lead: ICON.list, title: esc(tk.data?.title ?? tk.title ?? "Task"), sub: d ? esc(`Due ${dayName(d, today)}`) : "" })]);
+    }
+  }
+  if (kind === "url" && /^https:\/\//i.test(id)) {
+    const moodle = p.data?.kind === "moodle";
+    if (moodle) { loadMaterials(p); v.body = materialsHtml(p); }
+    const mail = p.data?.kind === "email" ? mailUrl(id) : null; // an email's link only when it's a known webmail host
+    v.links = mail === "" ? "" : linkButton(mail ?? id, moodle ? "Open Moodle" : mail ? "Open in Gmail" : "Open");
+  }
+  if (kind === "lecture") {
+    const lec = lectures.find((l) => l.id === id), { pre, post } = lec ? lectureNotes(lec, noteById) : {}, n = post ?? pre;
+    if (n) { v.body = summaryHtml(n); v.ask = noteAsk(n); }
+    if (lec) v.links = studyButton(`lecture:${id}`);
+  }
+  if (!v.body && !v.links) v.body = `<p class="foot">The rest isn’t on this phone yet. It arrives with the next sync from the Mac.</p>`;
+  return v;
+}
+
+/** A lecture note's short version: the first section's opening paragraphs and its "In short", else the Markdown's first section. */
+function summaryHtml(n) {
+  const blocks = Array.isArray(n.data?.doc?.blocks) ? n.data.doc.blocks : [], h2 = blocks.findIndex((b) => b?.t === "h2"), end = blocks.findIndex((b, i) => i > h2 && b?.t === "h2");
+  const pick = [...blocks.slice(h2 + 1, end < 0 ? undefined : end).filter((b) => b?.t === "p").slice(0, 2), ...blocks.filter((b) => b?.t === "inshort").slice(0, 1)];
+  const body = typeof n.data?.body === "string" ? n.data.body.split(/\n(?=## )/).find((s) => s.trim()) ?? "" : "";
+  const html = (pick.length ? lectureDoc({ version: 1, blocks: pick }, {}, []) : null) ?? (body.trim() ? markdown(body) : "");
+  return playerHtml(n) + (html ? `<div class="prose tight">${html}</div>` : `<p class="foot">Nothing to summarise yet.</p>`);
+}
+const noteAsk = (n) => ({ key: `note:${n.id}`, label: docTitle(n) ?? n.title ?? "these notes", chips: CHIPS.note,
+  context: () => `Notes: ${docTitle(n) ?? n.title ?? ""}\nModule: ${n.module ?? ""}\n\n${docText(n)}` });
+
+/** The Moodle batch: materials that reached Supabase within 15 minutes of the ping (the sync that made it).
+ *  ponytail: a time window, because the ping doesn't list its materials; PingDetect.moodle can add `items` if it ever misses. */
+async function loadMaterials(p) {
+  if (materials.has(p.id)) return;
+  if (DEMO) return materials.set(p.id, demoMaterials());
+  const at = Date.parse(p.data?.at);
+  if (!sb || !at) return materials.set(p.id, false);
+  materials.set(p.id, null);
+  try {
+    const rows = await run(items("material", "id,module,title,data,created_at").gte("created_at", new Date(at - 15 * 6e4).toISOString()).lte("created_at", new Date(at + 15 * 6e4).toISOString()).limit(40));
+    materials.set(p.id, rows.filter((r) => r.data?.type !== "recording"));
+  } catch { materials.set(p.id, false); }
+  render();
+}
+function materialsHtml(p) {
+  const list = materials.get(p.id);
+  if (list === undefined || list === null) return `<p class="foot" role="status">Loading what’s new…</p>`;
+  if (!list || !list.length) return `<p class="foot">The new files are on Moodle.</p>`;
+  return `<ul class="group">${list.map((m) => { const url = typeof m.data?.url === "string" && /^https:\/\//i.test(m.data.url) ? m.data.url : null, files = Array.isArray(m.data?.files) ? m.data.files.length : 0;
+    return row({ tag: url ? "a" : "div", attrs: url ? `href="${esc(url)}" target="_blank" rel="noopener noreferrer"` : "", lead: ICON.doc, title: esc(m.title ?? "Untitled"), titleCls: "clamp",
+      sub: esc([short(m.module), m.data?.section, files && plural(files, "file")].filter(Boolean).join(" · ")), chev: !!url }); }).join("")}</ul>`;
+}
+
+/** A message thread: who, where, the text (plain, never HTML), and the reply draft to copy. There is no Send. */
+function messageSheet(list) {
+  const m = messageView(list.at(-1)), id = m.id, link = replyLink(m), state = drafting.get(id), has = replies.has(id) || !!m.draft;
+  const texts = list.map(messageView).map((x) => `${list.length > 1 && x.received ? `<p class="foot">${esc(when(x.received))}</p>` : ""}<div class="msg-text">${plainHtml(x.body) || `<p class="foot">No text.</p>`}</div>`).join("");
+  const open = link ? linkButton(link.href, link.label) : "";
+  return {
+    title: m.sender, meta: [m.service, m.received && when(m.received) + (localDay(m.received) === todayString() ? "" : ", " + clock(new Date(m.received)))].filter(Boolean).join(" · "),
+    body: `<section class="msg">${m.subject ? `<p class="headline">${esc(m.subject)}</p>` : ""}${m.reason ? `<p class="foot">${esc(m.reason)}</p>` : ""}${texts}
+        ${m.cut ? `<p class="foot">${esc(link?.label ?? "Open the app")} for the rest.</p>` : ""}</section>
+      <p class="caption-h">Reply</p>
+      ${has ? `<ul class="group flat"><li><textarea id="draft-text" class="draft" rows="6" aria-label="Draft reply"></textarea></li>
+          <li class="how"><input id="draft-how" type="text" placeholder="How should it sound?" aria-label="How should it sound?" enterkeyhint="go" autocomplete="off">
+            <button class="btn plain" type="button" data-act="draft"${state === true ? " disabled" : ""}>${state === true ? "Drafting…" : "Redraft"}</button></li></ul>
+        <div class="btns"><button class="btn primary" type="button" data-act="copy-draft">${copied === id ? "Copied" : "Copy"}</button>${open.replace(" small", "")}</div>`
+      : `<div class="btns"><button class="btn secondary" type="button" data-act="draft"${state === true ? " disabled" : ""}>${state === true ? "Drafting…" : "Draft reply"}</button>${open.replace(" small", "")}</div>`}
+      ${typeof state === "string" ? `<p class="foot warn" role="alert">${esc(state)}</p>` : `<p class="foot">Sidebrain never sends. Copy it, then send it from ${esc(m.service)}.</p>`}`,
+    links: "",
+    ask: { key: `msg:${id}`, label: `${m.sender}’s message`, chips: CHIPS.item,
+      context: () => `${m.service} message from ${m.sender}${m.received ? `, received ${new Date(m.received).toISOString()}` : ""}\nSubject: ${m.subject}\nWhy it's priority: ${m.reason}\n\n${threadBody(list)}` },
+  };
+}
+
+async function draftReply() {
+  const list = threadOf(sheetItem);
+  if (!list || drafting.get(sheetItem) === true) return;
+  const id = sheetItem, uid = user?.id, m = messageView(list.at(-1)), thread = { ...m, body: threadBody(list) };
+  drafting.set(id, true); render();
+  let text = "", error = "";
+  try {
+    text = answerText(DEMO ? await demoAnswer(demoDraft(thread)) : await ai(draftRequest(thread, how, firstName()), "drafts"));
+    if (!text) error = "Nexi didn’t return a draft. Try again.";
+  } catch (e) { error = e.message || "Couldn’t draft that. Try again."; }
+  if (user?.id !== uid) return; // signed out meanwhile: the draft goes nowhere
+  if (error) drafting.set(id, error); else { replies.set(id, text); drafting.delete(id); copied = null; }
+  render();
+}
+
+async function copyDraft() {
+  const ta = $("draft-text");
+  if (!ta) return;
+  try { await navigator.clipboard.writeText(ta.value); copied = sheetItem; }
+  catch { ta.focus(); ta.select(); drafting.set(sheetItem, "Couldn’t copy. The text is selected: copy it from the menu."); }
+  render();
+  setTimeout(() => { if (copied) { copied = null; render(); } }, 2000);
+}
+
+// ---------- Nexi: Ask in context (Today, notes, any Inbox item) and a full chat from + (v2 design §6) ----------
+// Through Sidebrain's own `ai` function and its per-user cap. Answers are plain text (plainHtml): no Markdown, links or images.
+
+const firstName = () => user?.name || "the user";
+const CHIP_ASK = { "Explain this": "Explain this simply.", "Quiz me": "Quiz me on this, one question at a time.", "What first?": "What should I do first?" };
+const chats = new Map();      // context key → [{role, text}]; "chat" (the + chat) is kept on this phone, the rest for this session
+const chatLog = (key) => { if (!chats.has(key)) chats.set(key, key === "chat" ? load("nexi-chat", []) : []); return chats.get(key); };
+let nx = null, nxBusy = false, nxError = "", nxScroll = false; // nxScroll: a turn was added, so the log follows it once
+
+/** POST to the `ai` function. ponytail: twin of train.js `call`; share one helper once the gym lane agrees. */
+async function ai(body, task) {
+  const t = (await sb?.auth.getSession())?.data?.session?.access_token;
+  if (!t) throw new Error("Sign in to use Nexi.");
+  const r = await fetch(`${SUPABASE_URL}/functions/v1/ai`, { method: "POST", body: JSON.stringify(body),
+    headers: { Authorization: `Bearer ${t}`, apikey: SUPABASE_ANON_KEY, "Content-Type": "application/json", "X-Sidebrain-Task": task } });
+  const j = await r.json().catch(() => ({}));
+  // The function's 403/503 copy points at the Mac's own-AI setting, which the phone doesn't have.
+  if (!r.ok) throw new Error(String(j.error?.message ?? (typeof j.error === "string" ? j.error : "Couldn’t reach Nexi. Try again.")).replace(/\s*Choose your own AI in Settings[^.]*\./, ""));
+  return j;
+}
+
+/** Today's facts for Nexi: now, what's left today, the week's classes, open to-dos, deadlines in 7 days, cards due, the priority. */
+function todayContext() {
+  const now = new Date(), today = todayString(), sched = daySchedule(events, now, 0, true), rows = dueSoon(tasks, assessments, applications, today);
+  const p = brief?.date?.slice(0, 10) === today ? brief.data?.priority : null;
+  const lines = [`Now: ${longDate()}, ${clock(now)}`,
+    `Left today: ${[...sched.now, ...sched.next].slice(0, 8).map((e) => `${e.time} ${e.title}${e.location ? ` (${place(e.location)})` : ""}`).join("; ") || "nothing"}`,
+    `This week: ${upNext({ events, notes: [...noteById.values()] }, now).filter((r) => r.kind === "class" && r.day > today).slice(0, 10).map((r) => `${shortDay(r.day)} ${r.time} ${r.title}`).join("; ") || "nothing"}`,
+    `To do: ${rows.filter((r) => r.kind === "task").slice(0, 10).map((r) => r.title + (r.date ? ` (due ${r.date.slice(0, 10)})` : "")).join("; ") || "nothing"}`,
+    `Deadlines in 7 days: ${rows.filter((r) => r.kind !== "task" && r.days != null && r.days <= 7).slice(0, 5).map((r) => `${r.title}, ${r.detail ?? ""} (${r.date.slice(0, 10)})`).join("; ") || "none"}`,
+    `Flashcards due: ${due(cards, today).length}`, p?.title ? `Today's priority: ${p.title}${p.why ? `. ${withoutGreeting(p.why)}` : ""}` : ""];
+  return lines.filter(Boolean).join("\n").slice(0, 3000);
+}
+const todayAsk = () => ({ key: "today", label: "your day", chips: ["What first?"], context: todayContext });
+const chatAsk = () => ({ key: "chat", label: "", chips: [], context: todayContext });
+
+function openNexi(ctx) {
+  if (!ctx) return;
+  nx = ctx; nxError = ""; nxScroll = true;
+  renderNexi();
+  openSheet($("nexi-sheet"));
+  if (!ctx.chips.length) setTimeout(() => $("nexi-q").focus(), 60);
+}
+
+function renderNexi() {
+  if (!nx) return;
+  const log = chatLog(nx.key);
+  say("nexi-about", nx.label ? `About ${nx.label}` : "Your day, notes and deadlines");
+  paint($("nexi-log"), (log.length ? log.map((t) => `<div class="bubble${t.role === "user" ? " me" : ""}">${plainHtml(t.text)}</div>`).join("")
+      : `<p class="foot nexi-hint">${nx.label ? "Ask anything about this." : "Ask about your day, notes or deadlines."} Nexi only reads: it can’t send or change anything.</p>`)
+    + (nxBusy ? `<div class="bubble typing" role="status" aria-label="Nexi is thinking"><i></i><i></i><i></i></div>` : "")
+    + (nxError ? `<p class="foot warn" role="alert">${esc(nxError)}</p>` : ""));
+  paint($("nexi-chips"), log.length || nxBusy ? "" : nx.chips.map((c) => `<button class="chip-btn" type="button" data-chip="${esc(c)}"><span class="chip">${esc(c)}</span></button>`).join(""));
+  $("nexi-send").disabled = nxBusy || !$("nexi-q").value.trim();
+  if (nxScroll) { nxScroll = false; $("nexi-log").scrollTop = $("nexi-log").scrollHeight; }
+}
+
+/** One turn: the chip's label (or the typed text) shows; the answer arrives whole (no streaming through the proxy). */
+async function askNexi(question, label = question) {
+  if (!nx || nxBusy || !question.trim()) return;
+  const ctx = nx, uid = user?.id, log = chatLog(ctx.key), history = log.slice();
+  log.push({ role: "user", text: label });
+  nxBusy = true; nxError = ""; nxScroll = true;
+  renderNexi();
+  let text = "", error = "";
+  try {
+    text = answerText(DEMO ? await demoAnswer(demoAsk(question, ctx)) : await ai(askRequest(history, ctx.context(), question, firstName()), "nexi"));
+    if (!text) error = "Nexi didn’t answer. Try again.";
+  } catch (e) { error = e.message || "Couldn’t reach Nexi. Try again."; }
+  nxBusy = false;
+  if (user?.id !== uid) return; // signed out meanwhile: nothing is kept or shown
+  if (error) { log.pop(); nxError = error; if (label === question && !$("nexi-q").value) $("nexi-q").value = question; }
+  else { log.push({ role: "assistant", text }); say("nexi-live", text); }
+  if (ctx.key === "chat") keep("nexi-chat", log.slice(-20));
+  nxScroll = true;
+  if (nx === ctx) renderNexi();
 }
 
 // ---------- Opening a target: ?open=, a notification tap, Up next and the Inbox (contract §3) ----------
@@ -1103,7 +1478,11 @@ function takeLink(href) {
 }
 /** Opens the pending link once the data has what it points at; `final` (fresh data, or none coming) gives up with a note. */
 function routePending(final) {
-  if (pendingPing && (pings.some((x) => x.id === pendingPing) || final)) { pingWrite(pendingPing, {}); pendingPing = null; }
+  if (pendingPing && (pings.some((x) => x.id === pendingPing) || final)) {
+    if (messages.some((m) => m.data?.ping === pendingPing)) { pending = null; openItem(pendingPing); } // an email: its message, with the draft
+    else pingWrite(pendingPing, {});
+    pendingPing = null;
+  }
   if (!pending) return;
   if (openTarget(pending)) pending = null;
   else if (final) { pending = null; tell("That isn’t on this phone yet. It arrives with the next sync from the Mac."); }
@@ -1113,6 +1492,15 @@ function routePending(final) {
 function openTarget(target) {
   const t = String(target ?? ""), at = t.indexOf(":"), kind = t.slice(0, at), id = t.slice(at + 1);
   if (t === "train") { if (!trainOn) return false; switchTab("train"); return true; } // the rest-over push and WHOOP's return
+  if (t === "food" || kind === "food") { // ?open=food, ?open=food:photo|text|barcode; Food is part of Train, so off with it
+    if (!trainOn) return false;
+    for (const d of document.querySelectorAll("dialog[open]")) d.close();
+    if (kind === "food") food.openLog(id); else food.open();
+    return true;
+  }
+  // Shortcuts and the Action Button (?open=review, add:note): one press to the right place.
+  if (t === "review") { openReview(); return true; }
+  if (t === "add:note") { openAdd("note"); return true; }
   if (at < 1) return false;
   for (const d of document.querySelectorAll("dialog[open]")) d.close();
   reviewing = false;
@@ -1431,6 +1819,7 @@ function go(screen) {
   navigate("push", () => { stack.push(screen); render(); scrollTo(0, 0); });
 }
 function back(animate = true) {
+  if (tab === "train") return train.back();
   if (stack.length < 2) return;
   setMenu(null, true);
   const pop = () => { stack.pop(); render(); scrollTo(0, top().y ?? 0); };
@@ -1616,7 +2005,8 @@ function setMenu(kind, now = false) {
   menu.innerHTML = kind === "contents"
     ? screenSections.map((x) => `<li${x.id === cur ? ` class="cur"` : ""}><button type="button" data-jump="${x.id}">${ICON.tickMark}<span class="lbl">${esc(x.title)}</span></button></li>`).join("")
     : [m?.url && `<li><a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer" data-act="docs">${ICON.open}<span class="lbl">Open in Google Docs</span></a></li>`,
-       m?.module && `<li><button type="button" data-act="note-class" data-m="${esc(m.module)}" data-l="${esc(m.lecture ?? "")}">${ICON.note}<span class="lbl">Note for this class</span></button></li>`].filter(Boolean).join("");
+       m?.module && `<li><button type="button" data-act="note-class" data-m="${esc(m.module)}" data-l="${esc(m.lecture ?? "")}">${ICON.note}<span class="lbl">Note for this class</span></button></li>`,
+       m?.ask && `<li><button type="button" data-act="ask-note" data-n="${esc(m.ask)}">${ICON.bubble}<span class="lbl">Ask Nexi</span></button></li>`].filter(Boolean).join("");
   menu.dataset.kind = kind;
   const r = $(kind).getBoundingClientRect();
   menu.style.right = `${Math.max(8, innerWidth - r.right + 4)}px`; // scales from its trigger
@@ -1652,9 +2042,10 @@ function lectureScreen(id, today) {
   const deck = cards.filter((c) => c.module === lec.module && c.data?.lecture === n), dueHere = dueFor(lec.module, n);
   const qs = practice.filter((q) => q.module === lec.module && q.data?.lecture === n);
   const sections = [], body = note ? noteHtml(note, sections) : "";
+  opened(note);
   const day = lectureDay(lec), over = !day || day.slice(0, 10) < today; // ponytail: the day, not the timetable's end time as on the Mac
   screenSections = sections;
-  screenMore = { url: typeof url === "string" && url.startsWith("https://") ? url : null, module: lec.module, lecture: n };
+  screenMore = { url: typeof url === "string" && url.startsWith("https://") ? url : null, module: lec.module, lecture: n, ask: body ? note.id : null };
   const slides = note?.data?.kind === "post" && note.data.from === "slides" && !body.includes(`class="provenance"`);
   return `${head(lec.data?.topic ?? lec.title ?? "Lecture", [short(lec.module), n, day && shortDay(day.slice(0, 10))].filter(Boolean).join(" · "))}
     ${pre && post ? `<div class="seg" role="tablist" aria-label="Which note" style="--n: 2; --i: ${usePrimer ? 0 : 1}"><span class="thumb" aria-hidden="true"></span>${[["Primer", true], ["Notes", false]]
@@ -1669,12 +2060,17 @@ function lectureScreen(id, today) {
     ${qs.length ? `<p class="caption-h">Practice</p>${qs.map((q) => practiceCard(q)).join("")}` : ""}`;
 }
 
+/** Post-lecture notes read here get openedAt once, so Suggestions stops asking (N5). */
+const opened = (n) => { if (tab === "study" && n?.data?.kind === "post" && !n.user_data?.openedAt) writeUser(n, { openedAt: Date.now() }, "edit"); };
+
 function noteScreen(id) {
   const note = noteById.get(id);
   if (!note) return head("Notes") + empty(ICON.doc, "Notes not found", "The last sync may have removed them.");
   const sections = [], body = noteHtml(note, sections), url = note.data?.docUrl;
+  opened(note);
   screenSections = sections;
-  screenMore = typeof url === "string" && url.startsWith("https://") ? { url } : null;
+  const docs = typeof url === "string" && url.startsWith("https://") ? url : null;
+  screenMore = docs || body ? { url: docs, ask: body ? id : null } : null;
   return head(docTitle(note) ?? note.title ?? (note.data?.kind === "map" ? "Module map" : "Lecture notes")) + (body || empty(ICON.doc, "Nothing in these notes", "They may still be building on the Mac."));
 }
 
@@ -1728,6 +2124,8 @@ function renderSheet() {
     <ul class="group">
       <li><label class="row">${ICON.bell}<span class="text"><span class="title">Notifications</span>${note ? `<span class="subtitle wrap${reminderError ? " warn" : ""}">${esc(note)}</span>` : ""}</span>
         <input type="checkbox" switch id="remind" ${reminders === "on" ? "checked" : ""} ${["on", "off"].includes(reminders) ? "" : "disabled"} aria-label="Notifications"></label></li>
+      <li><label class="row">${ICON.list}<span class="text"><span class="title">Suggestions</span><span class="subtitle">Up to 2 a day on Today, 08:00–22:00</span></span>
+        <input type="checkbox" switch id="sug-on" ${sugOn ? "checked" : ""} aria-label="Suggestions"></label></li>
       <li><label class="row">${ICON.dumbbell}<span class="text"><span class="title">Train</span><span class="subtitle">Gym plan and logging</span></span>
         <input type="checkbox" switch id="train-on" ${trainOn ? "checked" : ""} aria-label="Train"></label></li>
       ${trainOn ? train.accountRows() : ""}
@@ -1947,18 +2345,17 @@ function bind() {
   document.addEventListener("click", (e) => {
     if (reviewing && e.target.closest("#review .flash, #review .review-top, #review .progress") && !e.target.closest("button")) return flip(); // tap anywhere reveals
     const t = e.target.closest("[data-act],[data-grade],[data-tab],[data-tick],[data-task],[data-move],[data-letgo],[data-module],[data-lecture],[data-note],[data-practice],[data-primer],[data-check],[data-skip],[data-jump],[data-dg],[data-dg-all],[data-close],[data-mode],[data-remove-photo],"
-      + "[data-open],[data-ping],[data-pmore],[data-popen],[data-class],[data-snooze],[data-pdone],[data-cl],[data-step],[data-qz],[data-play],[data-ver],[data-speed],[data-theme-pick]");
+      + "[data-open],[data-ping],[data-class],[data-later],[data-study],[data-chip],[data-cl],[data-step],[data-qz],[data-play],[data-ver],[data-speed],[data-theme-pick]");
     if (!t) return;
     const d = t.dataset;
     if (t.closest("#contents-menu") && !d.jump) setMenu(null, true); // a ••• item: the menu goes as it acts
     if (d.close != null) return closeSheet(t.closest("dialog"));
     if (d.open) return openTarget(d.open) || tell("That isn’t on this phone yet. It arrives with the next sync from the Mac.");
-    if (d.ping) return openPing(d.ping);
+    if (d.ping) return openItem(d.ping);
     if (d.class) { const list = t.closest(".choices")._list ?? []; captureFor = d.class === "none" ? false : list[Number(d.class)] ?? null; classPick = false; render(); return $("add-sheet").querySelector("textarea").focus(); }
-    if (d.pmore) return openPingSheet(d.pmore);
-    if (d.popen != null) { closeSheet($("ping-sheet")); return openPing(sheetPing); }
-    if (d.snooze) { pingWrite(sheetPing, { snoozedUntil: d.snooze, seenAt: null }); closeSheet($("ping-sheet")); return render(); }
-    if (d.pdone != null) { closeSheet($("ping-sheet")); return triage(sheetPing, true); }
+    if (d.later) { closeSheet($("item-sheet")); return triage(sheetItem, false, new Date(d.later)); }
+    if (d.study) { closeSheet($("item-sheet")); return d.study.startsWith("module:") ? study([{ s: "module", m: d.study.slice(7) }]) : openTarget(d.study) || tell("That isn’t on this phone yet. It arrives with the next sync from the Mac."); }
+    if (d.chip) return askNexi(CHIP_ASK[d.chip] ?? d.chip, d.chip);
     if (d.play) return togglePlay(d.play);
     if (d.ver) { if (player.version !== d.ver || player.id !== t.closest("[data-player]").dataset.player) { stopAudio(); player.id = t.closest("[data-player]").dataset.player; player.version = d.ver; } return render(); }
     if (d.speed != null) { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; keep("speed", speed); audio.playbackRate = speed; return render(); }
@@ -1975,6 +2372,7 @@ function bind() {
     if (d.task) return openTaskSheet(d.task);
     if (d.move) return move(sheetTask, d.move);
     if (d.letgo != null) return letGo(sheetTask);
+    if (d.mode === "ask") { closeSheet($("add-sheet")); return openNexi(chatAsk()); }
     if (d.mode) { setMode(d.mode); return (d.mode === "todo" ? $("todo") : $("add-sheet").querySelector("textarea")).focus(); }
     if (d.removePhoto != null) return setPhoto(t.closest("form"), null);
     if (d.themePick) return applyTheme(d.themePick);
@@ -1982,10 +2380,21 @@ function bind() {
     switch (d.act) {
       case "fold": return toggleFold(t.closest("[data-fold]"));
       case "gym": if (!train.openToday?.()) switchTab("train"); return;
+      case "rugby": return answer(d.v);
+      case "rugby-clear": dailyWrite({ rugby: null, answeredAt: null }); return render();
+      case "sug": return sugAct(d.key);
+      case "sug-started": return sugAct(d.key, true);
+      case "sug-more": sugKey = d.key; say("sug-msg", sugRows.find((x) => x.key === d.key)?.title ?? ""); return openSheet($("sug-sheet"));
+      case "sug-mute": return sugMute(d.mute);
       case "add": return openAdd("todo");
       case "note-class": captureFor = { module: d.m, lecture: d.l || null }; openAdd("note"); return render();
       case "class-pick": classPick = !classPick; render(); return $("add-sheet").querySelector("[data-act=class-pick]")?.focus();
-      case "inbox-older": inboxAll = true; return render();
+      case "item-done": closeSheet($("item-sheet")); return triage(sheetItem, true);
+      case "item-later": laterOpen = !laterOpen; return renderItem();
+      case "draft": return draftReply();
+      case "copy-draft": return copyDraft();
+      case "ask-item": return openNexi(itemAsk);
+      case "ask-note": return noteById.has(d.n) && openNexi(noteAsk(noteById.get(d.n)));
       case "flip": return flip();
       case "review": return openReview(d.m || null, d.l || null);
       case "close-review": return closeReview();
@@ -2021,6 +2430,9 @@ function bind() {
   }, true);
   document.addEventListener("input", (e) => {
     if (e.target.matches?.("form.compose textarea")) return canSave(e.target.closest("form"));
+    if (e.target.id === "draft-text") { replies.set(sheetItem, e.target.value); copied = null; return; }
+    if (e.target.id === "draft-how") { how = e.target.value; return; }
+    if (e.target.id === "nexi-q") { $("nexi-send").disabled = nxBusy || !e.target.value.trim(); return; }
     if (e.target.dataset?.guess != null) return drafts.set(guessKey(e.target), e.target.value);
     if (e.target.dataset?.draft == null) return;
     drafts.set(e.target.dataset.draft, e.target.value);
@@ -2036,10 +2448,12 @@ function bind() {
       return;
     }
     if (el.id === "remind") return toggleReminders();
+    if (el.id === "sug-on") { sugOn = el.checked; keep("suggestions", sugOn); return render(); }
     if (el.id === "train-on") { trainOn = el.checked; keep("train", trainOn); if (trainOn) refresh(); return render(); }
     if (el.name === "photo") return el.files?.[0] && setPhoto(el.closest("form"), el.files[0]);
   });
   document.addEventListener("submit", (e) => {
+    if (e.target.id === "nexi-form") { e.preventDefault(); const q = $("nexi-q").value.trim(); $("nexi-q").value = ""; return askNexi(q); }
     if (!e.target.matches("form.compose")) return;
     e.preventDefault();
     saveCompose(e.target);
@@ -2048,6 +2462,7 @@ function bind() {
   document.addEventListener("click", (e) => { if (e.target.matches?.("input[type=date].overlay")) try { e.target.showPicker(); } catch { /* not allowed here */ } });
   document.addEventListener("keydown", (e) => {
     if (menuFor && e.key === "Escape") return setMenu(null);
+    if (e.target.id === "draft-how" && e.key === "Enter") { e.preventDefault(); return draftReply(); }
     if (!reviewing || document.querySelector("dialog[open]") || e.target.matches("textarea, input")) return;
     if (e.key === "Escape") return closeReview();
     if (!current() && (e.key === " " || e.key === "Enter")) { e.preventDefault(); return closeReview(); }
@@ -2055,6 +2470,7 @@ function bind() {
     if (e.key === "1" || e.key === "2") grade(e.key === "1" ? 0 : 2);
   });
   $("account").onclick = () => { reminderError = ""; renderSheet(); openSheet($("sheet")); };
+  $("ask").onclick = () => openNexi(todayAsk());
   $("back").onclick = back;
   $("contents").onclick = () => setMenu(menuFor === "contents" ? null : "contents");
   $("more").onclick = () => setMenu(menuFor === "more" ? null : "more");
@@ -2116,6 +2532,7 @@ function switchTab(next) {
   setMenu(null, true);
   tabY[tab] = scrollY;
   if (next === tab && next === "study") { stack = [{ s: "home" }]; tabY.study = 0; } // the current tab again: back to its start
+  if (next === tab && next === "train") { train.reset(); tabY.train = 0; }
   tab = next;
   render();
   scrollTo(0, tabY[tab] ?? 0); // instant, as native tabs are
@@ -2176,9 +2593,11 @@ function demoData() {
         start: new Date(Date.now() - 20 * 6e4).toISOString(), end: new Date(Date.now() + 40 * 6e4).toISOString(), location: "Portland A13" }, user_data: {} }] : []),
     ].filter(Boolean),
     pings: demoPings(),
+    messages: demoMessages(),
     assessments: [
       assess("assess-crg-essay", crg, day(5), { title: "Essay", weight: "50%", milestones: [{ date: day(1), label: "Outline to tutor" }, { date: day(12), label: "Full draft" }] }),
-      assess("assess-sm-group", sm, day(24), { title: "Group presentation", weight: "30%", milestones: [{ date: day(6), label: "Slides to the group" }] }),
+      assess("assess-sm-group", sm, day(24), { title: "Group presentation", weight: "30%", milestones: [{ date: day(-1), label: "Pick the case company" }, { date: day(6), label: "Slides to the group" }] }), // Suggestions N2
+      assess("assess-ms-report", "Marketing & Society", day(16), { title: "Consumer report", weight: "40%" }), // Suggestions N3
       assess("assess-ms-essay", "Marketing & Society", day(63), { title: "M&S essay", weight: "50%" }),
       assess("assess-sm-exam", sm, day(100), { title: "Exam", weight: "70%" }),
     ],
@@ -2203,6 +2622,7 @@ function demoData() {
       { id: "app-demo-orbis", title: null, date: day(4), data: { org: "Orbis", role: "Summer Analyst", stage: "Applying" }, user_data: {} },
       { id: "app-demo-lazard", title: null, date: day(3), data: { org: "Lazard", role: "Spring Insight", stage: "Submitted 2 Oct" }, user_data: {} }, // R3
       { id: "app-demo-jpm", title: null, date: day(5), data: { org: "JPMorgan", role: "Off-cycle", status: "rejected" }, user_data: {} },             // R3
+      { id: "app-demo-bain", title: null, date: day(10), data: { org: "Bain", role: "Associate Consultant Intern", stage: "Applying" }, user_data: {} }, // Suggestions N1
     ],
     notes: [
       { id: "you-demo-n1", source: "you", title: "Ask Dr Lane", data: { body: "Ask Dr Lane if the essay can use 2025 annual reports" }, user_data: {}, created_at: daysAgo(2 / 24) },
@@ -2267,9 +2687,46 @@ function demoPings() {
     ping("ping-notes-crg-l1", "CRG L1 notes ready", ago(26 * 60), "notes", "note:auto-post-crg-l1", { seenAt: Date.now() - 25 * 36e5 }),
     ping("ping-deadline-crg-outline", "CRG essay outline due tomorrow", ago(4 * 60), "deadline", "item:assess-crg-essay"),
     ping("ping-brief-ms-sem1", "M&S Seminar 1 brief", at(0, "20:00"), "brief", "note:auto-pre-ms-sem1"),
-    ping("ping-nudge-ms-sem1", "M&S Seminar 1 in an hour", at(1, "10:00"), "nudge", "listen:auto-pre-ms-sem1"),
+    ping("ping-nudge-ms-sem1", "M&S Seminar 1 in 30 min · JC CS A01", at(1, "10:00"), "nudge", "listen:auto-pre-ms-sem1"),
     ping("ping-reask-ms-sem1", "M&S Seminar 1: three questions", at(2, "09:00"), "reask", "reask:auto-pre-ms-sem1"),
+    // A priority email's ping: its message row (demoMessages) stands for it, so the Inbox shows the message once.
+    ping("ping-app-email-demo-lane", "Dr Sarah Lane: CRG essay outline", ago(40), "email", "url:https://mail.google.com/mail/u/0/#inbox/demo"),
   ];
+}
+
+/** Priority messages as the Mac mirrors them (v2 design §1): a Gmail with its email ping and a free draft, a two-message
+ *  WhatsApp thread, a LinkedIn. */
+function demoMessages() {
+  const ago = (mins) => new Date(Date.now() - mins * 6e4).toISOString();
+  const msg = (id, data) => ({ id, title: data.sender, date: localDay(Date.parse(data.received)), data, user_data: {} });
+  return [
+    msg("msg-demo-lane", { service: "Gmail", sender: "Dr Sarah Lane", subject: "CRG essay outline", received: ago(40), replyNeeded: true, ping: "ping-app-email-demo-lane",
+      url: "https://mail.google.com/mail/u/0/#inbox/demo", reason: "Your tutor asks when the outline will be ready.",
+      body: "Hi,\n\nThanks for your question in the seminar. Could you send me your essay outline by Thursday? One page is plenty: your question, the two theories you’ll argue between, and the evidence you plan to use.\n\nIf Thursday doesn’t work, tell me which day does.\n\nBest wishes,\nSarah",
+      draft: "Hi Sarah,\n\nThanks, I’ll send the outline by Thursday. It will set out my question, Jensen (2002) and Hart & Zingales (2022) as the two sides, and the annual reports I plan to use.\n\nBest wishes" }),
+    msg("msg-demo-tom-1", { service: "WhatsApp", sender: "Tom (rugby)", received: ago(95), replyNeeded: true, reason: "Asks if you’re playing Saturday.", body: "Are you in for Saturday?" }),
+    msg("msg-demo-tom-2", { service: "WhatsApp", sender: "Tom (rugby)", received: ago(92), replyNeeded: true, reason: "Asks if you’re playing Saturday.", body: "Coach needs numbers by tonight" }),
+    msg("msg-demo-orbis", { service: "LinkedIn", sender: "Hannah Price", received: ago(26 * 60), reason: "Orbis recruiter, about the Summer Analyst deadline.",
+      body: "Thanks for connecting. Applications for the Summer Analyst programme close on Friday. Happy to answer questions about the assessment centre before then." }),
+  ];
+}
+const demoMaterials = () => [
+  { id: "moodle-cm-demo-1", module: "Marketing & Society", title: "Week 4 slides: Advertising and children", data: { type: "resource", section: "Week 4", url: "https://moodle.nottingham.ac.uk/", files: [{ name: "W4 slides.pdf" }] } },
+  { id: "moodle-cm-demo-2", module: "Marketing & Society", title: "Seminar 2 reading list", data: { type: "page", section: "Week 4", url: "https://moodle.nottingham.ac.uk/" } },
+  { id: "moodle-cm-demo-3", module: "Corporate Restructuring & Governance", title: "Lecture 3 Part 1: Executive pay", data: { type: "url", section: "Week 3", url: "https://moodle.nottingham.ac.uk/" } },
+];
+/** Nexi in the demo: a canned answer after half a second, no network. Free text is echoed back, so the plain-text
+ *  rendering can be seen (a typed <img> shows as text in the answer too). */
+const demoAnswer = (text) => new Promise((ok) => setTimeout(() => ok({ output: [{ type: "message", content: [{ type: "output_text", text }] }] }), 500));
+const demoDraft = (m) => (m.service === "WhatsApp" ? "Yes, I’m in for Saturday. See you there."
+  : m.service === "LinkedIn" ? "Hi Hannah, thanks. I’m applying this week and would value ten minutes on the assessment centre. Would [day] suit you?"
+  : `Hi ${m.sender.replace(/^Dr /, "").split(" ")[0]},\n\nThanks, I’ll send it by [day].\n\nBest wishes`);
+function demoAsk(q, ctx) {
+  if (q === CHIP_ASK["What first?"]) return ctx.key === "today" ? "Start with “Outline the CRG essay”: the outline goes to your tutor tomorrow. Then read Jensen & Meckling before the seminar."
+    : `Start with ${ctx.label}: it’s the nearest thing due. Then clear today’s to-dos.`;
+  if (q === CHIP_ASK["Explain this"]) return `In the demo this is sample text. Signed in, Nexi explains ${ctx.label} in plain words, using only what’s on screen.`;
+  if (q === CHIP_ASK["Quiz me"]) return `Question 1 on ${ctx.label}: what is the one idea you’d have to explain in the exam? Reply and I’ll mark it.`;
+  return `Demo answer to “${q}”. Signed in, Nexi answers from your day, notes and messages.`;
 }
 
 /** Study's sample: two modules, three lectures, a structured doc (every block type, a blank diagram, folded answers),

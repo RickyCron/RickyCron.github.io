@@ -351,6 +351,11 @@ export const ordered = (lectures) => {
   return lectures.filter((l) => l.source !== "moodle" || !jobs.has(label(l))).sort((a, b) =>
     number(b.data?.n) - number(a.data?.n) || ((b.date ?? "") > (a.date ?? "") ? 1 : (b.date ?? "") < (a.date ?? "") ? -1 : 0));
 };
+/** Study's module list: one row per module name, the newest (StudyModel.modules: uni-lectures wrote mod-managing-it-systems
+ *  on 2 Oct and mod-managing-it-and-systems since), then by code. */
+export const modulesByName = (rows) =>
+  [...new Map([...rows].sort((a, b) => ((a.updated_at ?? "") < (b.updated_at ?? "") ? -1 : 1)).map((m) => [m.module ?? m.title ?? m.id, m])).values()]
+    .sort((a, b) => ((a.data?.code ?? "") < (b.data?.code ?? "") ? -1 : 1));
 /** A lecture's own day, null when it is only the day its slides went up (data.dated "posted"), so that day is never shown
  *  or taken for the next lecture (StudyModel.lectureDay). */
 export const lectureDay = (l) => (l?.data?.dated === "posted" ? null : l?.date ?? null);
